@@ -1,0 +1,83 @@
+# Built-in wording checks and journal limits. A project adds or drops wording patterns in its
+# interleaf.toml under [lint] (extra = [...], ignore = [...]).
+# Patterns are regular expressions (Rust regex syntax: no lookaround), matched case-insensitively
+# on comment-free text.
+
+[lint.claim]
+why = "claim: needs evidence in the sentence, or a plainer word"
+patterns = [
+  '\bfor the first time\b', '\b(?:is|are|was|were) the first\b', '\bfirst (?:to|study|work|model|attempt)\b',
+  '\bnovel\b', '\bunprecedented\b', '\boutperform\w*', '\bbetter than\b', '\bsuperior\b',
+  '\bprov(?:e|es|ed|en)\b', '\bclearly\b', '\bobviously\b', '\bundoubtedly\b', '\bstate[- ]of[- ]the[- ]art\b',
+  '\bgroundbreaking\b',
+]
+
+[lint.ai]
+why = "reads as machine-written"
+patterns = [
+  '\bdelv\w*', '\bintricat\w*', '\bpivotal\b', '\bcrucial(?:ly)?\b', '\bunderscor\w*', '\bshowcas\w*',
+  '\bleverag\w*', '\bseamless\w*', '\btapestry\b', '\brealm\b', '\blandscape\b', '\bmultifaceted\b',
+  '\bnotably\b', '\bmoreover\b', '\bfurthermore\b', '\bit is (?:worth|important to) not\w*',
+  '\bplays? an? (?:key|crucial|vital|pivotal|important) role\b', '\ba testament to\b',
+  '\bshed(?:s|ding)? light on\b', '\bpav(?:e|es|ing) the way\b', '\bnuanced\b',
+]
+
+# Journal limits, read from each journal's author guidelines on 2026-11-22 (source = page used).
+# text_words counts the main text without abstract, floats, acknowledgments, appendices,
+# Methods and references. require = phrases that must appear (case-insensitive).
+
+[journal.apj]
+name = "ApJ, ApJS, AJ, PSJ"
+abstract_words = 250
+recommend = ['\software{', '\facilities{']
+source = "https://journals.aas.org/aastexguide/"
+
+[journal.apjl]
+name = "ApJ Letters (limits are guides)"
+abstract_words = 250
+text_words = 3500
+display_items = 5
+recommend = ['\software{', '\facilities{']
+source = "https://journals.aas.org/the-astrophysical-journal-letters/"
+
+[journal.agu]
+name = "AGU (JGR, AGU Advances)"
+abstract_words = 250
+keypoints = 3
+keypoint_chars = 140
+pls_words = 200
+require = ["open research", "conflict"]
+source = "https://www.agu.org/publications/authors/journals/text-graphics-requirements"
+
+[journal.grl]
+name = "Geophysical Research Letters"
+abstract_words = 150
+keypoints = 3
+keypoint_chars = 140
+pls_words = 200
+publication_units = 12
+require = ["open research", "conflict"]
+source = "https://www.agu.org/publications/authors/journals/submission-checklists"
+
+[journal.pnas]
+name = "PNAS Research Report (6 pages ~ 4000 words; 12 pages at most)"
+abstract_words = 250
+significance_words = 120
+text_words = 4000
+source = "https://www.pnas.org/author-center/submitting-your-manuscript"
+
+[journal.nature]
+name = "Nature Article (6 pages, 4 display items)"
+abstract_words = 200
+text_words = 2500
+display_items = 4
+require = ["data availability", "code availability", "author contributions", "competing interest"]
+source = "https://www.nature.com/nature/for-authors/formatting-guide"
+
+[journal.science]
+name = "Science Research Article"
+abstract_words = 125
+text_words = 3000
+display_items = 5
+require = ["funding", "author contributions", "competing interests", "availability"]
+source = "https://www.science.org/content/page/science-information-authors"
