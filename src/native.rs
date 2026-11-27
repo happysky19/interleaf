@@ -1,4 +1,6 @@
-//! Native Overleaf comments. Login and project authorization belong to the launcher.
+mod edits;
+mod socket;
+// Native Overleaf collaboration. Login and project authorization belong to the launcher.
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -126,6 +128,28 @@ impl NativeSession {
             "native_list_comments" => &["project_id", "include_resolved", "include_orphaned", "full"],
             "native_read_comment_thread" => &["project_id", "thread_id"],
             "native_reply_comment" => &["project_id", "thread_id", "content", "operation_id"],
+            "native_read_file" => &["project_id", "path"],
+            "native_list_tracked_changes" => &["project_id", "path"],
+            "native_suggest_edit" => &[
+                "project_id",
+                "path",
+                "old_string",
+                "new_string",
+                "occurrence",
+                "expected_version",
+                "operation_id",
+                "track",
+                "strict_version",
+            ],
+            "native_add_comment" => &[
+                "project_id",
+                "path",
+                "quoted_text",
+                "occurrence",
+                "content",
+                "expected_version",
+                "operation_id",
+            ],
             _ => bail!("unknown native tool"),
         };
         ensure!(
@@ -134,8 +158,14 @@ impl NativeSession {
         );
         let project = need(args, "project_id")?;
         id(project)?;
-        if name != "native_list_comments" {
+        if matches!(name, "native_read_comment_thread" | "native_reply_comment") {
             id(need(args, "thread_id")?)?;
+        }
+        if args.contains_key("path") {
+            edits::path(need(args, "path")?)?;
+        }
+        if matches!(name, "native_read_file" | "native_suggest_edit" | "native_add_comment") {
+            need(args, "path")?;
         }
         for key in ["include_resolved", "include_orphaned", "full"] {
             ensure!(
@@ -143,23 +173,68 @@ impl NativeSession {
                 "native filters must be booleans"
             );
         }
-        if name == "native_reply_comment" {
+        if matches!(name, "native_reply_comment" | "native_add_comment") {
             let content = need(args, "content")?;
             ensure!(
                 !content.trim().is_empty() && content.len() <= 32768,
-                "reply must contain 1–32768 bytes of text"
+                "comment must contain 1–32768 bytes of text"
             );
-            let op = need(args, "operation_id")?;
+        }
+        if matches!(name, "native_suggest_edit" | "native_add_comment") {
             ensure!(
-                crate::text::re!(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").is_match(op),
-                "a stable operation_id UUID is required; reuse it when checking an uncertain reply"
+                args.get("expected_version")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|v| v < 9_007_199_254_740_991),
+                "expected_version is required; read the current native file first"
+            );
+            ensure!(
+                args.get("occurrence")
+                    .is_none_or(|v| v.as_u64().is_some_and(|n| (1..=1_000_000).contains(&n))),
+                "occurrence must be a positive bounded integer"
+            );
+        }
+        if name == "native_suggest_edit" {
+            ensure!(
+                args.get("track").is_none_or(|v| v == "on"),
+                "pending suggestions require track=on"
+            );
+            ensure!(
+                args.get("strict_version").is_none_or(|v| v == true),
+                "pending suggestions require strict_version=true"
+            );
+            ensure!(
+                need(args, "old_string")?.len() <= 32768
+                    && args
+                        .get("new_string")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.len() <= 32768),
+                "old_string and new_string must be bounded strings"
+            );
+        }
+        if name == "native_add_comment" {
+            ensure!(
+                need(args, "quoted_text")?.len() <= 32768,
+                "comment quote exceeds size limit"
+            );
+        }
+        if matches!(
+            name,
+            "native_reply_comment" | "native_suggest_edit" | "native_add_comment"
+        ) {
+            ensure!(
+                crate::text::re!(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+                    .is_match(need(args, "operation_id")?),
+                "a stable operation_id UUID is required; reuse it when checking an uncertain write"
             );
         }
         let mut client = Client::new(self, project)?;
-        let threads = client.threads()?;
         let value = match name {
-            "native_list_comments" => client.list(args, &threads)?,
+            "native_list_comments" => {
+                let threads = client.threads()?;
+                client.list(args, &threads)?
+            }
             "native_read_comment_thread" => {
+                let threads = client.threads()?;
                 let thread = need(args, "thread_id")?;
                 ensure!(
                     threads.get(thread).is_some(),
@@ -167,24 +242,39 @@ impl NativeSession {
                 );
                 json!({"project_id":project,"thread_id":thread,"thread":threads[thread],"complete":true})
             }
-            "native_reply_comment" => client.reply(self, args, &threads)?,
-            _ => unreachable!(),
+            "native_reply_comment" => {
+                let threads = client.threads()?;
+                client.reply(self, args, &threads)?
+            }
+            _ => edits::call(&mut client, self, name, args)?,
         };
-        Ok(client.redact(&serde_json::to_string(&value)?))
+        let encoded = client.redact(&serde_json::to_string(&value)?);
+        ensure!(
+            encoded.len() <= 8 * 1024 * 1024,
+            "native result too large; select a document"
+        );
+        Ok(encoded)
     }
 }
 
 pub(crate) fn definitions() -> Vec<Value> {
     let project = json!({"type":"string","pattern":"^[0-9a-f]{24}$","description":"Explicit Overleaf project ID from its URL; required on every call"});
     let thread = json!({"type":"string","pattern":"^[0-9a-f]{24}$"});
+    let path = json!({"type":"string","description":"Project-relative text document path, e.g. main.tex or sections/introduction.tex"});
+    let version = json!({"type":"integer","minimum":0,"description":"The exact version returned by native_read_file"});
+    let occurrence = json!({"type":"integer","minimum":1,"description":"1-based exact match to use when text occurs more than once"});
+    let operation = json!({"type":"string","format":"uuid","description":"Stable write UUID; reuse the same ID and arguments when checking an outcome"});
     [
-        ("native_list_comments", "Read native review threads and quoted anchors. Open, anchored threads by default.", json!({"project_id":project,"include_resolved":{"type":"boolean"},"include_orphaned":{"type":"boolean"},"full":{"type":"boolean"}}), vec!["project_id"], true),
-        ("native_read_comment_thread", "Read all messages, authors and timestamps in one native review thread.", json!({"project_id":project,"thread_id":thread}), vec!["project_id","thread_id"], true),
-        ("native_reply_comment", "Reply once to an existing native thread. Keep operation_id unchanged on retry; uncertain writes are never resubmitted.", json!({"project_id":project,"thread_id":thread,"content":{"type":"string"},"operation_id":{"type":"string","format":"uuid"}}), vec!["project_id","thread_id","content","operation_id"], false),
-    ].into_iter().map(|(name, description, properties, required, read_only)| json!({
-        "name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},
-        "annotations":{"readOnlyHint":read_only,"destructiveHint":false,"idempotentHint":true}
-    })).collect()
+        ("native_list_comments","Read native review threads and quoted anchors. Open, anchored threads by default.",json!({"project_id":project,"include_resolved":{"type":"boolean"},"include_orphaned":{"type":"boolean"},"full":{"type":"boolean"}}),vec!["project_id"],true),
+        ("native_read_comment_thread","Read all messages, authors and timestamps in one native review thread.",json!({"project_id":project,"thread_id":thread}),vec!["project_id","thread_id"],true),
+        ("native_reply_comment","Reply once to an existing native thread. Uncertain writes are never resubmitted.",json!({"project_id":project,"thread_id":thread,"content":{"type":"string"},"operation_id":operation}),vec!["project_id","thread_id","content","operation_id"],false),
+        ("native_read_file","Read current live text and native document version before proposing an edit or anchor.",json!({"project_id":project,"path":path}),vec!["project_id","path"],true),
+        ("native_list_tracked_changes","Read the complete pending Track Changes inventory. Optional path selects one document; no changes are accepted or rejected.",json!({"project_id":project,"path":path}),vec!["project_id"],true),
+        ("native_suggest_edit","Suggest one exact replacement as pending Track Changes. Checks expected_version, preserves existing suggestions and verifies readback. Uncertain writes are never replayed.",json!({"project_id":project,"path":path,"old_string":{"type":"string","minLength":1},"new_string":{"type":"string"},"occurrence":occurrence,"expected_version":version,"operation_id":operation,"track":{"type":"string","const":"on"},"strict_version":{"type":"boolean","const":true}}),vec!["project_id","path","old_string","new_string","expected_version","operation_id"],false),
+        ("native_add_comment","Create a native comment anchored to exact quoted text at expected_version. On a race, a partial thread remains for reconciliation; no destructive rollback or retry.",json!({"project_id":project,"path":path,"quoted_text":{"type":"string","minLength":1},"content":{"type":"string"},"occurrence":occurrence,"expected_version":version,"operation_id":operation}),vec!["project_id","path","quoted_text","content","expected_version","operation_id"],false),
+    ].into_iter().map(|(name,description,properties,required,read_only)|json!({"name":name,"description":description,
+        "inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},
+        "annotations":{"readOnlyHint":read_only,"destructiveHint":false,"idempotentHint":true}})).collect()
 }
 
 fn meta(html: &str, name: &str) -> Result<String> {
@@ -405,6 +495,52 @@ impl Client {
         }
         Ok(json!({"project_id":self.project,"threads":rows,"count":rows.len(),"complete":true}))
     }
+    fn message(&mut self, thread: &str, content: &str) -> Result<Option<String>> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/project/{}/thread/{thread}/messages",
+                self.origin, self.project
+            ))
+            .header("Cookie", &self.cookie)
+            .header("X-Csrf-Token", &self.csrf)
+            .header("Accept", "application/json")
+            .send_json(json!({"content":content}))
+            .map_err(|_| anyhow!("reply outcome uncertain"))?;
+        let body = self.body(response, "application/json")?;
+        if body.is_empty() {
+            return Ok(None);
+        }
+        let response: Value = serde_json::from_str(&body).map_err(|_| anyhow!("reply outcome uncertain"))?;
+        Ok(response["id"]
+            .as_str()
+            .filter(|v| valid_message_id(v) && self.redact(v) == *v)
+            .map(str::to_owned))
+    }
+    fn posted_message_id(
+        &mut self,
+        thread: &str,
+        content: &str,
+        returned: Option<&str>,
+        previous: &BTreeSet<&str>,
+    ) -> Result<Option<String>> {
+        let after = self.threads()?;
+        let candidates: Vec<_> = after[thread]["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["content"] == content && author(m) == Some(self.account.as_str()))
+            .filter_map(|m| m["id"].as_str())
+            .filter(|id| !previous.contains(id))
+            .collect();
+        if let Some(id) = returned {
+            return Ok(candidates
+                .into_iter()
+                .find(|candidate| *candidate == id)
+                .map(str::to_owned));
+        }
+        Ok((candidates.len() == 1).then(|| candidates[0].to_owned()))
+    }
     fn reply(&mut self, session: &NativeSession, args: &Map<String, Value>, threads: &Value) -> Result<Value> {
         let thread = need(args, "thread_id")?;
         ensure!(
@@ -424,57 +560,56 @@ impl Client {
                 content
             ]))?)
         );
-        let (path, mut receipt, fresh) = reserve(&session.receipts, operation, &binding, &self.project, thread)?;
+        let (file, mut receipt, fresh) = reserve(
+            &session.receipts,
+            operation,
+            &binding,
+            &self.project,
+            Some(thread),
+            Value::Null,
+        )?;
         if !fresh {
-            // An existing receipt is authoritative. Checking it is read-only,
-            // including while another process is still completing the write.
             return Ok(outcome(&receipt, true));
         }
-        // The durable attempt precedes the POST. A crash/lost ACK cannot resubmit it.
-        let attempt = (|| -> Result<Option<String>> {
-            let response = self
-                .http
-                .post(format!(
-                    "{}/project/{}/thread/{thread}/messages",
-                    self.origin, self.project
-                ))
-                .header("Cookie", &self.cookie)
-                .header("X-Csrf-Token", &self.csrf)
-                .header("Accept", "application/json")
-                .send_json(json!({"content":content}))
-                .map_err(|_| anyhow!("reply outcome uncertain"))?;
-            let body = self.body(response, "application/json")?;
-            if body.is_empty() {
-                return Ok(None);
+        let previous: BTreeSet<_> = threads[thread]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        // Only an acknowledged POST may use an id-less response fallback.
+        // A lost acknowledgement stays uncertain even if a matching body appears.
+        if let Ok(returned) = self.message(thread, content) {
+            receipt.message_id = returned.clone();
+            if save(&file, &receipt).is_err() {
+                return Ok(outcome(&receipt, false));
             }
-            let response: Value = serde_json::from_str(&body).map_err(|_| anyhow!("reply outcome uncertain"))?;
-            Ok(response["id"]
-                .as_str()
-                .filter(|v| valid_message_id(v) && self.redact(v) == *v)
-                .map(str::to_owned))
-        })();
-        if let Ok(message) = attempt {
-            receipt.message_id = message;
+            if let Ok(Some(id)) = self.posted_message_id(thread, content, returned.as_deref(), &previous) {
+                receipt.message_id = Some(id);
+                receipt.verified = true;
+                receipt.state = "confirmed".into();
+            }
         }
-        if let Some(message) = &receipt.message_id {
-            receipt.verified = self.threads().ok().is_some_and(|all| {
-                all[thread]["messages"].as_array().is_some_and(|messages| {
-                    messages.iter().any(|m| {
-                        m["id"] == *message && m["content"] == content && author(m) == Some(self.account.as_str())
-                    })
-                })
-            });
-            receipt.state = if receipt.verified { "confirmed" } else { "uncertain" }.into();
-        }
-        let persisted = save(&path, &receipt).is_ok();
+        let persisted = save(&file, &receipt).is_ok();
         Ok(outcome(&receipt, persisted))
     }
 }
 
 fn outcome(receipt: &Receipt, persisted: bool) -> Value {
-    json!({"operation_id":receipt.operation_id,"project_id":receipt.project_id,"thread_id":receipt.thread_id,"message_id":receipt.message_id,
-        "state":if persisted {receipt.state.as_str()} else {"uncertain"},"verified":receipt.verified && persisted,"receipt_persisted":persisted,
-        "next":if receipt.verified && persisted {"complete"} else {"Read the thread and reconcile; do not resubmit with a new operation_id."}})
+    let complete = receipt.verified && persisted;
+    let next = if complete {
+        "complete"
+    } else if receipt.details["operation"] == "native_suggest_edit" {
+        "Read native_read_file and native_list_tracked_changes to reconcile; retain this operation_id and do not resubmit with a new ID."
+    } else if receipt.details["operation"] == "native_add_comment" {
+        "Read native_read_comment_thread for this thread_id and native_list_comments with include_orphaned=true; retain this operation_id and do not resubmit."
+    } else {
+        "Read native_read_comment_thread for this thread_id to reconcile; retain this operation_id and do not resubmit with a new ID."
+    };
+    let mut result = receipt.details.as_object().cloned().unwrap_or_default();
+    result.extend(json!({"operation_id":receipt.operation_id,"project_id":receipt.project_id,"thread_id":receipt.thread_id,"message_id":receipt.message_id,
+        "state":if persisted {receipt.state.as_str()}else{"uncertain"},"verified":complete,"receipt_persisted":persisted,"next":next}).as_object().unwrap().clone());
+    Value::Object(result)
 }
 
 fn author(message: &Value) -> Option<&str> {
@@ -494,7 +629,9 @@ struct Receipt {
     operation_id: String,
     binding: String,
     project_id: String,
-    thread_id: String,
+    thread_id: Option<String>,
+    #[serde(default)]
+    details: Value,
     message_id: Option<String>,
     state: String,
     verified: bool,
@@ -505,7 +642,8 @@ fn reserve(
     operation: &str,
     binding: &str,
     project: &str,
-    thread: &str,
+    thread: Option<&str>,
+    details: Value,
 ) -> Result<(PathBuf, Receipt, bool)> {
     if !root.exists() {
         let mut builder = fs::DirBuilder::new();
@@ -517,26 +655,15 @@ fn reserve(
         builder.create(root).context("cannot create native receipt directory")?;
         File::open(root.parent().ok_or_else(|| anyhow!("receipt parent missing"))?)?.sync_all()?;
     }
-    let meta = fs::symlink_metadata(root)?;
-    ensure!(
-        meta.is_dir() && !meta.file_type().is_symlink(),
-        "receipt directory must be a real private directory"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        ensure!(
-            meta.permissions().mode() & 0o077 == 0,
-            "receipt directory must be private (0700)"
-        );
-    }
+    check_receipt_dir(root)?;
     let path = root.join(format!("{operation}.json"));
     let receipt = Receipt {
         schema: 1,
         operation_id: operation.into(),
         binding: binding.into(),
         project_id: project.into(),
-        thread_id: thread.into(),
+        thread_id: thread.map(str::to_owned),
+        details,
         message_id: None,
         state: "uncertain".into(),
         verified: false,
@@ -550,32 +677,65 @@ fn reserve(
             Ok((path, receipt, true))
         }
         Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let mut options = fs::OpenOptions::new();
-            options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(nix::libc::O_NOFOLLOW);
-            }
-            let file = options.open(&path)?;
-            ensure!(
-                file.metadata()?.is_file() && file.metadata()?.len() <= 4096,
-                "invalid native receipt; do not retry"
-            );
-            let prior: Receipt = serde_json::from_reader(file.take(4097))
-                .map_err(|_| anyhow!("invalid native receipt; do not retry"))?;
-            ensure!(
-                prior.schema == 1
-                    && prior.operation_id == operation
-                    && prior.binding == binding
-                    && prior.project_id == project
-                    && prior.thread_id == thread,
-                "operation_id is already bound to another reply"
-            );
+            let prior = existing(root, operation, binding, project)?
+                .ok_or_else(|| anyhow!("native receipt disappeared; do not retry"))?;
+            ensure!(prior.thread_id.as_deref() == thread, "operation_id target changed");
             Ok((path, prior, false))
         }
         Err(_) => bail!("cannot persist native attempt; no reply submitted"),
     }
+}
+
+fn existing(root: &Path, operation: &str, binding: &str, project: &str) -> Result<Option<Receipt>> {
+    match fs::symlink_metadata(root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
+    check_receipt_dir(root)?;
+    let path = root.join(format!("{operation}.json"));
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    ensure!(
+        file.metadata()?.is_file() && file.metadata()?.len() <= 16384,
+        "invalid native receipt; do not retry"
+    );
+    let receipt: Receipt =
+        serde_json::from_reader(file.take(16385)).map_err(|_| anyhow!("invalid native receipt; do not retry"))?;
+    ensure!(
+        receipt.schema == 1
+            && receipt.operation_id == operation
+            && receipt.binding == binding
+            && receipt.project_id == project,
+        "operation_id is already bound to another operation"
+    );
+    Ok(Some(receipt))
+}
+fn check_receipt_dir(root: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(root)?;
+    ensure!(
+        meta.is_dir() && !meta.file_type().is_symlink(),
+        "receipt directory must be a real private directory"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            meta.permissions().mode() & 0o077 == 0,
+            "receipt directory must be private (0700)"
+        );
+    }
+    Ok(())
 }
 
 fn save(path: &Path, receipt: &Receipt) -> Result<()> {
@@ -615,7 +775,7 @@ mod tests {
         thread: Option<thread::JoinHandle<()>>,
     }
     impl Fixture {
-        fn start(lost_response: bool) -> Self {
+        fn start(lost_response: bool, no_message_id: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -670,6 +830,10 @@ mod tests {
                         if lost_response {
                             continue;
                         }
+                        if no_message_id {
+                            write!(stream, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
+                            continue;
+                        }
                         ("application/json", json!({"id":"message-new"}).to_string())
                     } else if url.ends_with("/threads") {
                         let mut messages = vec![
@@ -718,6 +882,9 @@ mod tests {
         }
     }
     fn rpc(native: NativeSession, name: &str, args: Value) -> Value {
+        rpc_expect(native, name, args, false)
+    }
+    fn rpc_expect(native: NativeSession, name: &str, args: Value, expected_error: bool) -> Value {
         let input = format!(
             "{}\n",
             json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}})
@@ -725,13 +892,13 @@ mod tests {
         let mut output = Vec::new();
         crate::serve_with_native(input.as_bytes(), &mut output, native).unwrap();
         let response: Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(response["result"]["isError"], expected_error, "{response}");
         serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
     }
     #[test]
     fn native_comments_read_and_reply_without_replay() {
-        for lost in [false, true] {
-            let f = Fixture::start(lost);
+        for (lost, idless) in [(false, false), (true, false), (false, true)] {
+            let f = Fixture::start(lost, idless);
             let root = tempfile::tempdir().unwrap();
             let receipts = root.path().join("receipts");
             let input = format!("{}\n", json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
@@ -759,12 +926,12 @@ mod tests {
             );
             assert_eq!(before["thread"]["messages"].as_array().unwrap().len(), 1);
             let args = json!({"project_id":PROJECT,"thread_id":THREAD,"content":"A precise reply.","operation_id":OP});
-            let result = rpc(f.session(&receipts), "native_reply_comment", args.clone());
+            let result = rpc_expect(f.session(&receipts), "native_reply_comment", args.clone(), lost);
             assert_eq!(result["state"], if lost { "uncertain" } else { "confirmed" });
             assert_eq!(result["verified"], !lost);
             let receipt_path = std::fs::read_dir(&receipts).unwrap().next().unwrap().unwrap().path();
             let prior_modified = std::fs::metadata(&receipt_path).unwrap().modified().unwrap();
-            let again = rpc(f.session(&receipts), "native_reply_comment", args);
+            let again = rpc_expect(f.session(&receipts), "native_reply_comment", args, lost);
             assert_eq!(again["state"], result["state"]);
             assert_eq!(
                 std::fs::metadata(&receipt_path).unwrap().modified().unwrap(),
@@ -824,7 +991,7 @@ mod tests {
 
     #[test]
     fn malformed_targets_and_changed_operation_payload_never_post() {
-        let f = Fixture::start(false);
+        let f = Fixture::start(false, false);
         let root = tempfile::tempdir().unwrap();
         let native = f.session(&root.path().join("receipts"));
         for args in [
@@ -861,3 +1028,6 @@ mod tests {
         assert_eq!(f.posts.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+mod socket_tests;

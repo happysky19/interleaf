@@ -648,7 +648,14 @@ fn handle(session: &mut Session, msg: &Value) -> Option<Value> {
             session.client = params["clientInfo"]["name"].as_str().unwrap_or("agent").to_owned();
             let want = params["protocolVersion"].as_str().unwrap_or("");
             let version = if PROTOCOLS.contains(&want) { want } else { PROTOCOLS[0] };
-            json!({"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": "interleaf", "version": VERSION}, "instructions": INSTRUCTIONS})
+            let instructions = if session.native.is_some() {
+                format!(
+                    "{INSTRUCTIONS} Native tools operate directly in Overleaf. Read native_read_file before an edit or anchor; use its exact version and retain the same operation_id. Uncertain writes require read-only reconciliation. Native writes and Git synchronization are separate operations."
+                )
+            } else {
+                INSTRUCTIONS.to_owned()
+            };
+            json!({"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": "interleaf", "version": VERSION}, "instructions": instructions})
         }
         "ping" => json!({}),
         "tools/list" => {
@@ -668,7 +675,17 @@ fn handle(session: &mut Session, msg: &Value) -> Option<Value> {
             {
                 let empty = Map::new();
                 let (text, error) = match native.call(name, params["arguments"].as_object().unwrap_or(&empty)) {
-                    Ok(text) => (text, false),
+                    Ok(text) => {
+                        let write = matches!(
+                            name,
+                            "native_reply_comment" | "native_suggest_edit" | "native_add_comment"
+                        );
+                        let uncertain = write
+                            && serde_json::from_str::<Value>(&text)
+                                .map(|v| v["state"] != "confirmed")
+                                .unwrap_or(true);
+                        (text, uncertain)
+                    }
                     Err(e) => (format!("{e:#}"), true),
                 };
                 return Some(

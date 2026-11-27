@@ -116,33 +116,63 @@ limits are in `src/rules.toml`.
 - Tests: `cargo test`. The end-to-end test runs against a local bare repository that stands in for
   the remote, with a second clone acting as the co-author.
 
-## Native Overleaf comments (development)
+## Native Overleaf collaboration (development)
 
-The `dev/native-overleaf` branch adds native `native_list_comments`,
-`native_read_comment_thread` and `native_reply_comment` tools. They appear only
-when the launcher injects an Overleaf session. Every call requires an explicit
-`project_id`, so several papers can share one Fridica channel.
+This branch adds seven native tools alongside the existing Git and LaTeX tools:
 
-For example, read a review thread with:
+| Tool | Use |
+| --- | --- |
+| `native_list_comments` | List review threads and their quoted anchors |
+| `native_read_comment_thread` | Read every message in a thread |
+| `native_reply_comment` | Reply to an existing thread |
+| `native_read_file` | Read current text and its native version |
+| `native_list_tracked_changes` | Read the complete pending-change inventory |
+| `native_suggest_edit` | Propose one exact replacement as pending Track Changes |
+| `native_add_comment` | Create a comment anchored to exact quoted text |
 
+Name the `project_id` on every call. Several papers can share one Fridica channel.
+Start an edit or anchored comment by reading the live file:
+
+`native_read_file`:
 ```json
-{"project_id": "0123456789abcdef01234567", "thread_id": "abcdef0123456789abcdef01"}
+{"project_id": "0123456789abcdef01234567", "path": "main.tex"}
 ```
 
-A reply also takes `content` and a stable `operation_id` UUID. Reuse that UUID
-when checking the result. The backend saves an attempt before posting and reads
-the reply back before reporting it confirmed. A lost response stays uncertain;
-it never silently submits the reply again. Read the thread to reconcile it.
+Then use its returned `version` as `expected_version`:
 
-**For launcher integration:** keep login, account/project authorization and saved
-credentials in Fridica. Pass its existing `{baseUrl,cookie}` JSON envelope through
+`native_suggest_edit`:
+```json
+{
+  "project_id": "0123456789abcdef01234567",
+  "path": "main.tex",
+  "old_string": "the old approximation",
+  "new_string": "the revised approximation",
+  "expected_version": 95,
+  "operation_id": "dcd3d917-b8bc-4c47-83b5-5bfd02567b8c"
+}
+```
+
+Use `occurrence` (1-based) when the quoted text is not unique. Suggestions always
+use tracking and strict version checks. Edits that touch an existing pending
+change are refused. Readback must confirm the predicted text, next version,
+new pending records and preservation of the original records before success.
+
+Each write needs a stable `operation_id` UUID. Keep the ID and arguments unchanged
+when checking an outcome. The backend records the attempt before writing;
+repeated calls only return that receipt. A lost acknowledgement, concurrent edit
+or incomplete readback returns an MCP error with `state: "uncertain"`, safe IDs
+and reconciliation details. Read the file, pending changes or comment thread
+before further work. A partial comment thread is retained for inspection.
+
+**For launcher integration:** Fridica keeps login, account/project authorization
+and saved credentials. Pass its existing `{baseUrl,cookie}` JSON envelope through
 an anonymous Unix socket in `OL_SESSION_FD`, and set `INTERLEAF_NATIVE_RECEIPTS`
-to a private worker-state directory outside the paper checkout. The socket is
-consumed and closed on startup. Rust embedders can use `NativeSession::from_reader`
-and `serve_with_native` instead. The current origin is `https://www.overleaf.com`.
-No browser, Node process, cookie file or Git credential is used by this backend.
+to private worker state outside the paper checkout. The socket is consumed and
+closed on startup. Rust embedders can use `NativeSession::from_reader` and
+`serve_with_native`. The supported origin is `https://www.overleaf.com`; the
+native backend needs no Node process, browser, cookie file or Git credential.
 
-This is the first development slice. Anchored comment creation and native Track
-Changes are still pending; the running Fridica integration continues to use its
-existing backend until those operations and its policy attachment are complete.
-The existing Git and LaTeX tools keep working without a native session.
+The native tools appear only with an injected session. This development branch
+has not replaced Fridica's running backend; its policy/packaging attachment and
+live-account acceptance remain separate steps. No native accept/reject or
+untracked text-write tool is exposed.
