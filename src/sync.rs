@@ -13,7 +13,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 const EXCLUDE: &str =
     ".DS_Store\n*.aux\n*.log\n*.out\n*.fls\n*.fdb_latexmk\n*.synctex.gz\n*.blg\n*.bcf\n*.run.xml\n*~\n*.swp\n";
@@ -151,10 +151,14 @@ impl Repo {
     }
 
     fn run(&self, cwd: &Path, args: &[&str], env: &[(&str, &str)], input: Option<&str>) -> Result<Output> {
-        let mut cmd = Command::new("git");
+        let mut cmd = text::git_command();
         if self.p.overleaf_https() {
             cmd.args(["-c", "credential.helper=", "-c"])
-                .arg(format!("credential.helper={}", OVERLEAF_TOKEN.helper()));
+                .arg(format!(
+                    "credential.helper={}",
+                    OVERLEAF_TOKEN.helper(self.p.id.as_deref().unwrap())?
+                ))
+                .args(["-c", "credential.useHttpPath=true"]);
         }
         cmd.args([
             "-c",
@@ -253,6 +257,7 @@ impl Repo {
             self.checked(parent, &["clone", &self.p.git_url, &dir.to_string_lossy()], &[], None)?;
             text::write(&dir.join(".git/info/exclude"), EXCLUDE)?;
         }
+        self.verify_origin()?;
         if self.git(&["config", "user.name"]).unwrap_or_default().is_empty() {
             self.git(&["config", "user.name", &self.p.user])?;
             self.git(&["config", "user.email", "interleaf@localhost"])?;
@@ -260,7 +265,29 @@ impl Repo {
         Ok(())
     }
 
+    fn verify_origin(&self) -> Result<()> {
+        let top = self.git(&["rev-parse", "--show-toplevel"])?;
+        if std::fs::canonicalize(top)? != std::fs::canonicalize(self.dir())? {
+            bail!("project directory is not the origin checkout root");
+        }
+        for args in [
+            vec!["remote", "get-url", "--all", "origin"],
+            vec!["remote", "get-url", "--push", "--all", "origin"],
+        ] {
+            let urls = self.git(&args)?;
+            if urls.is_empty()
+                || urls
+                    .lines()
+                    .any(|url| !crate::config::same_remote(url, &self.p.git_url))
+            {
+                bail!("origin fetch/push URL does not match the requested project");
+            }
+        }
+        Ok(())
+    }
+
     pub fn fetch(&self) -> Result<()> {
+        self.verify_origin()?;
         self.need_token()?;
         self.git(&["fetch", "--prune", "origin"])?;
         Ok(())
@@ -550,11 +577,14 @@ impl Repo {
         if let Some(incoming) = pulled.get("incoming") {
             r.set("incoming merged", incoming.to_owned());
         }
-        let direct: Vec<String> = self
-            .direct_paths()
-            .into_iter()
-            .filter(|d| rows.iter().any(|(_, p)| p == d))
-            .collect();
+        let direct: Vec<String> = if o.transform.is_some() {
+            self.direct_paths()?
+                .into_iter()
+                .filter(|d| rows.iter().any(|(_, p)| p == d))
+                .collect()
+        } else {
+            vec![]
+        };
         if !direct.is_empty() {
             r.list("sent as is (resolved suggestions)", &direct);
         }
@@ -618,6 +648,7 @@ impl Repo {
             };
             self.git(&["commit", "-q", "-m", &message])?;
         }
+        self.verify_origin()?;
         let refspec = format!("HEAD:{}", self.branch());
         if !self.ok(&["push", "origin", &refspec])? {
             // someone pushed or typed in the browser meanwhile: rebase once and retry
@@ -637,21 +668,40 @@ impl Repo {
     }
 
     /// Files whose suggestions were just resolved: push sends them unmarked.
-    pub fn direct_paths(&self) -> BTreeSet<String> {
+    pub fn direct_paths(&self) -> Result<BTreeSet<String>> {
         let f = self.p.state().join("direct");
-        text::read(&f)
-            .map(|t| t.split_whitespace().map(str::to_owned).collect())
-            .unwrap_or_default()
+        if !f.exists() {
+            return Ok(BTreeSet::new());
+        }
+        let text = text::read(&f)?;
+        let recorded: BTreeMap<String, String> = serde_json::from_str(&text).map_err(|_| {
+            anyhow::anyhow!("legacy resolved-file marker cannot prove content; resolve again before pushing")
+        })?;
+        for (rel, expected) in &recorded {
+            let path = text::project_path(self.dir(), Path::new(rel))?;
+            let actual = self.git(&["hash-object", &path.to_string_lossy()])?;
+            if &actual != expected {
+                bail!(
+                    "resolved file {rel} changed again; push the resolution before new edits, or explicitly choose direct mode if authorized"
+                );
+            }
+        }
+        Ok(recorded.into_keys().collect())
     }
 
     pub fn mark_direct(&self, paths: &[String]) -> Result<()> {
-        let mut all = self.direct_paths();
-        all.extend(paths.iter().cloned());
+        let file = self.p.state().join("direct");
+        let mut recorded: BTreeMap<String, String> = if file.exists() {
+            serde_json::from_str(&text::read(&file)?).unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        for rel in paths {
+            let path = text::project_path(self.dir(), Path::new(rel))?;
+            recorded.insert(rel.clone(), self.git(&["hash-object", &path.to_string_lossy()])?);
+        }
         std::fs::create_dir_all(self.p.state())?;
-        text::write(
-            &self.p.state().join("direct"),
-            &(all.into_iter().collect::<Vec<_>>().join("\n") + "\n"),
-        )
+        text::write(&file, &serde_json::to_string(&recorded)?)
     }
 }
 

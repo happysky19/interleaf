@@ -93,11 +93,16 @@ struct Server {
 
 impl Server {
     fn start(cwd: &Path, config: &Path) -> Server {
+        Self::start_with_env(cwd, config, &[])
+    }
+
+    fn start_with_env(cwd: &Path, config: &Path, extra: &[(&str, String)]) -> Server {
         let mut child = Command::new(env!("CARGO_BIN_EXE_interleaf"))
             .current_dir(cwd)
             .env("INTERLEAF_CONFIG", config)
             .env_remove("INTERLEAF_WORKSPACE")
             .env_remove("OVERLEAF_PROJECT_ID")
+            .envs(extra.iter().map(|(key, value)| (*key, value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -465,7 +470,7 @@ fn group_workflow() {
         &intro,
         &good.replace("Another paragraph", "Another \\undefinedmacro paragraph"),
     );
-    let t = s.call("compile", json!({}));
+    let t = s.tool("compile", json!({}), true);
     assert!(
         regex::Regex::new(r"sections/intro\.tex:\d+: Undefined control sequence")
             .unwrap()
@@ -494,4 +499,175 @@ fn group_workflow() {
     assert!(w.remote_file("main.tex").contains(r"\section{Methods}"));
     assert!(w.remote_file("sections/intro.tex").contains("Yet another paragraph"));
     assert!(s.call("history", json!({"n": 3})).contains("Race"));
+}
+
+fn legacy_fixture(w: &World) -> (Server, PathBuf) {
+    let clone = w.path("clone");
+    let cfg = w.path("config.toml");
+    write(
+        &cfg,
+        &format!(
+            "name = \"Tester\"\ninitials = \"AB\"\n[projects.t]\ndir = \"{}\"\ngit_url = \"{}\"\n",
+            clone.display(),
+            w.path("overleaf.git").display()
+        ),
+    );
+    let mut server = Server::start(w.td.path(), &cfg);
+    server.call("status", json!({}));
+    (server, clone)
+}
+
+#[test]
+fn rejects_wrong_existing_origin() {
+    let w = world();
+    let (mut s, clone) = legacy_fixture(&w);
+    sh(
+        &clone,
+        &["git", "remote", "set-url", "origin", w.path("seed").to_str().unwrap()],
+    );
+    assert!(s.tool("outline", json!({}), true).contains("origin"));
+    sh(
+        &clone,
+        &[
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            w.path("overleaf.git").to_str().unwrap(),
+        ],
+    );
+    sh(
+        &clone,
+        &[
+            "git",
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            w.path("seed").to_str().unwrap(),
+        ],
+    );
+    assert!(s.tool("outline", json!({}), true).contains("origin"));
+}
+
+#[test]
+fn confines_project_destinations() {
+    let w = world();
+    let (mut s, clone) = legacy_fixture(&w);
+    let source = w.path("made.png");
+    std::fs::write(&source, PNG).unwrap();
+    for name in ["../outside.png", ".git/overwrite.png"] {
+        s.tool(
+            "add_figure",
+            json!({"source": source, "name": name, "subdir": "."}),
+            true,
+        );
+    }
+    s.tool(
+        "cite_add",
+        json!({"identifier":"ignored", "bibfile":"../escape.bib"}),
+        true,
+    );
+    s.tool(
+        "resolve",
+        json!({"action":"accept", "path": w.path("seed/main.tex")}),
+        true,
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(w.path("seed"), clone.join("escape")).unwrap();
+        s.tool("add_figure", json!({"source": source, "subdir":"escape"}), true);
+    }
+    assert!(!w.path("outside.png").exists());
+    assert!(!clone.join(".git/overwrite.png").exists());
+}
+
+#[test]
+fn resolution_marker_cannot_cover_new_edits() {
+    let w = world();
+    let (mut s, clone) = legacy_fixture(&w);
+    let intro = clone.join("sections/intro.tex");
+    edit(&intro, "Second line of the paragraph.", "Second line, edited.");
+    s.call("push", json!({"message":"suggest", "dry_run":false}));
+    s.call(
+        "resolve",
+        json!({"action":"accept", "author":"AB", "path":"sections/intro.tex"}),
+    );
+    edit(&intro, "Another paragraph", "Another fresh paragraph");
+    assert!(
+        s.tool("push", json!({"message":"must not send direct", "dry_run":false}), true)
+            .contains("resolved")
+    );
+    assert!(
+        s.call(
+            "push",
+            json!({"message":"explicit direct", "mode":"direct", "dry_run":false})
+        )
+        .contains("pushed")
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn build_artifacts_are_current_and_credentials_are_removed() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world();
+    let (s, clone) = legacy_fixture(&w);
+    drop(s);
+    let bin = w.path("test-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let fail = w.path("fail-build");
+    let script = r#"#!/bin/sh
+[ -z "${OVERLEAF_GIT_TOKEN}${ADS_TOKEN}${OL_COOKIE}${GH_TOKEN}${OPENAI_API_KEY}${ANTHROPIC_API_KEY}${SLACK_BOT_TOKEN}" ] || exit 72
+norc=no
+for arg do
+  case "$arg" in -norc) norc=yes;; -outdir=*) out=${arg#-outdir=};; esac
+  main=$arg
+done
+[ "$norc" = yes ] || exit 73
+[ ! -e "${0%/*}/../fail-build" ] || exit 42
+stem=${main##*/}
+stem=${stem%.tex}
+printf 'pdf for current input\n' > "$out/$stem.pdf"
+printf 'Output written on %s.pdf (1 page, 1 bytes).\n' "$stem" > "$out/$stem.log"
+"#;
+    write(&bin.join("latexmk"), script);
+    write(&bin.join("latexdiff"), "#!/bin/sh\ncat _new.tex\n");
+    for tool in ["latexmk", "latexdiff"] {
+        std::fs::set_permissions(bin.join(tool), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let env = vec![
+        ("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())),
+        ("OVERLEAF_GIT_TOKEN", "dummy-git".into()),
+        ("ADS_TOKEN", "dummy-ads".into()),
+        ("OL_COOKIE", "dummy-native".into()),
+        ("GH_TOKEN", "dummy-gh".into()),
+        ("OPENAI_API_KEY", "dummy-openai".into()),
+        ("ANTHROPIC_API_KEY", "dummy-anthropic".into()),
+        ("SLACK_BOT_TOKEN", "dummy-slack".into()),
+    ];
+    let mut s = Server::start_with_env(w.td.path(), &w.path("config.toml"), &env);
+    let t = s.call("compile", json!({}));
+    assert!(
+        t.contains("source_tree_sha256:")
+            && t.contains("source_scope: local working tree")
+            && t.contains("build_status: succeeded"),
+        "{t}"
+    );
+    let since = sh(&clone, &["git", "rev-parse", "HEAD"]).trim().to_owned();
+    let first = s.call("review", json!({"since": since}));
+    assert!(
+        first.contains("review-since-") && !first.contains("(not built)"),
+        "{first}"
+    );
+    assert!(
+        !first.contains("/_review.pdf"),
+        "review must not advertise the renamed build path: {first}"
+    );
+    write(&fail, "fail");
+    let failed = s.tool("review", json!({"since": since}), true);
+    assert!(
+        failed.contains("pdf: (not built)") && failed.contains("build_status: failed"),
+        "{failed}"
+    );
 }

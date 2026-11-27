@@ -28,7 +28,7 @@ fn latexdiff() -> Result<Vec<String>> {
 
 fn export(repo: &Repo, rev: &str, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)?;
-    let archive = Command::new("git")
+    let archive = crate::text::git_command()
         .args(["archive", rev])
         .current_dir(repo.dir())
         .stdout(Stdio::piped())
@@ -55,7 +55,7 @@ fn words(root: &Path, main: &str) -> Result<BTreeMap<String, usize>> {
 
 pub fn review(repo: &Repo, main: &str, since: &str, outdir: &Path, engine: &str) -> Result<String> {
     repo.fetch()?;
-    let remote = repo.remote();
+    let remote = repo.git(&["rev-parse", &repo.remote()])?;
     let rev = if re!(r"^[0-9a-f]{6,40}$").is_match(since) {
         since.to_owned()
     } else {
@@ -69,8 +69,14 @@ pub fn review(repo: &Repo, main: &str, since: &str, outdir: &Path, engine: &str)
     let (old, new): (PathBuf, PathBuf) = (td.path().join("old"), td.path().join("new"));
     export(repo, &rev, &old)?;
     export(repo, &remote, &new)?;
-    write(&new.join("_old.tex"), &tex::flatten(&old, main)?)?;
-    write(&new.join("_new.tex"), &tex::flatten(&new, main)?)?;
+    write(
+        &crate::text::project_path(&new, Path::new("_old.tex"))?,
+        &tex::flatten(&old, main)?,
+    )?;
+    write(
+        &crate::text::project_path(&new, Path::new("_new.tex"))?,
+        &tex::flatten(&new, main)?,
+    )?;
     let ld = latexdiff()?;
     let diff = Command::new(&ld[0])
         .args(&ld[1..])
@@ -80,14 +86,17 @@ pub fn review(repo: &Repo, main: &str, since: &str, outdir: &Path, engine: &str)
     if !diff.status.success() {
         bail!("latexdiff failed: {}", String::from_utf8_lossy(&diff.stderr).trim());
     }
-    write(&new.join("_review.tex"), &String::from_utf8_lossy(&diff.stdout))?;
+    write(
+        &crate::text::project_path(&new, Path::new("_review.tex"))?,
+        &String::from_utf8_lossy(&diff.stdout),
+    )?;
     let build = tex::compile(&new, "_review.tex", outdir, engine)?;
     let (before, after) = (words(&old, main)?, words(&new, main)?);
-    let pdf = outdir.join("_review.pdf");
+    let current_pdf = if build.success { build.pdf.as_ref() } else { None };
     let short = &rev[..rev.len().min(8)];
     let fin = outdir.join(format!("review-since-{short}.pdf"));
-    if pdf.exists() {
-        std::fs::rename(&pdf, &fin)?;
+    if let Some(pdf) = current_pdf {
+        std::fs::rename(pdf, &fin)?;
     }
     let mut rows: Vec<String> = after
         .iter()
@@ -104,11 +113,22 @@ pub fn review(repo: &Repo, main: &str, since: &str, outdir: &Path, engine: &str)
         rows.push("  (unchanged)".into());
     }
     let log = repo.log(&format!("{rev}..{remote}"), 50, false)?;
-    Ok([
+    let build_details = build
+        .report
+        .lines()
+        .skip(1)
+        .filter(|line| !line.starts_with("pdf: "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let report = [
         format!("changes on {} since {short}", repo.p.upstream()),
         format!(
+            "review_source: upstream Git commit {}",
+            repo.git(&["rev-parse", &remote])?
+        ),
+        format!(
             "pdf: {}",
-            if fin.exists() {
+            if current_pdf.is_some() {
                 fin.display().to_string()
             } else {
                 "(not built)".into()
@@ -121,7 +141,12 @@ pub fn review(repo: &Repo, main: &str, since: &str, outdir: &Path, engine: &str)
         "words per section:".into(),
         rows.join("\n"),
         String::new(),
-        format!("build: {}", build.lines().next().unwrap_or("")),
+        format!("build: {}", build.report.lines().next().unwrap_or("")),
+        build_details,
     ]
-    .join("\n"))
+    .join("\n");
+    if !build.success {
+        bail!("{report}");
+    }
+    Ok(report)
 }

@@ -1,5 +1,5 @@
 //! Helpers shared by the modules: files, character-safe slicing, brace groups, diffs.
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use similar::{Algorithm, DiffTag, capture_diff_slices};
 use std::hash::Hash;
 use std::ops::Range;
@@ -160,4 +160,79 @@ pub fn opcodes<T: Eq + Hash>(a: &[T], b: &[T]) -> Vec<(bool, Range<usize>, Range
 /// Lines with their line endings.
 pub fn lines(text: &str) -> Vec<&str> {
     text.split_inclusive('\n').collect()
+}
+
+/// A manuscript destination must stay inside its checkout, excluding Git metadata and symlinks.
+pub fn project_path(root: &Path, rel: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    if rel.as_os_str().is_empty() {
+        bail!("project path is empty");
+    }
+    let mut path = root.to_owned();
+    for component in rel.components() {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(name) if !name.to_string_lossy().eq_ignore_ascii_case(".git") => {
+                path.push(name);
+                if path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+                    bail!("project path contains a symlink: {}", rel.display());
+                }
+            }
+            _ => bail!("path must stay inside the project and outside .git: {}", rel.display()),
+        }
+    }
+    if path == root {
+        bail!("project path must name a file");
+    }
+    Ok(path)
+}
+
+/// Ignore ambient Git repository/index overrides while retaining the caller's Git executable.
+pub fn git_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
+/// Compilation does not need account credentials or inherited session descriptors.
+pub fn scrub_build_env(cmd: &mut std::process::Command) {
+    // TeX (including Lua) can inspect its environment without shell escape.
+    // Preserve only executable/search, locale and font/TeX configuration.
+    let values: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| {
+            let key = key.to_string_lossy();
+            matches!(
+                key.as_ref(),
+                "PATH"
+                    | "HOME"
+                    | "TMPDIR"
+                    | "TMP"
+                    | "TEMP"
+                    | "LANG"
+                    | "LC_ALL"
+                    | "LC_CTYPE"
+                    | "TZ"
+                    | "SOURCE_DATE_EPOCH"
+                    | "FONTCONFIG_FILE"
+                    | "FONTCONFIG_PATH"
+                    | "XDG_CACHE_HOME"
+                    | "XDG_CONFIG_HOME"
+            ) || key.starts_with("TEX")
+                || key.starts_with("BIB")
+                || key.starts_with("BST")
+        })
+        .collect();
+    cmd.env_clear().envs(values);
 }
