@@ -34,6 +34,7 @@ impl Args<'_> {
 
 struct Session {
     client: String,
+    native: Option<crate::NativeSession>,
 }
 
 /// The project named in the call, cloned on first use.
@@ -651,10 +652,29 @@ fn handle(session: &mut Session, msg: &Value) -> Option<Value> {
         }
         "ping" => json!({}),
         "tools/list" => {
-            json!({"tools": tools().into_iter().map(|(n, _, d, s)| json!({"name": n, "description": d, "inputSchema": s})).collect::<Vec<_>>()})
+            let mut definitions: Vec<Value> = tools()
+                .into_iter()
+                .map(|(n, _, d, s)| json!({"name": n, "description": d, "inputSchema": s}))
+                .collect();
+            if session.native.is_some() {
+                definitions.extend(crate::native::definitions());
+            }
+            json!({"tools": definitions})
         }
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
+            if name.starts_with("native_")
+                && let Some(native) = &session.native
+            {
+                let empty = Map::new();
+                let (text, error) = match native.call(name, params["arguments"].as_object().unwrap_or(&empty)) {
+                    Ok(text) => (text, false),
+                    Err(e) => (format!("{e:#}"), true),
+                };
+                return Some(
+                    json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":text}],"isError":error}}),
+                );
+            }
             let Some((_, tool, ..)) = tools().into_iter().find(|t| t.0 == name) else {
                 return Some(
                     json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("unknown tool {name}")}}),
@@ -674,8 +694,20 @@ fn handle(session: &mut Session, msg: &Value) -> Option<Value> {
 }
 
 /// Serve MCP over newline-delimited JSON-RPC until the input ends.
-pub fn serve(input: impl BufRead, mut output: impl Write) -> Result<()> {
-    let mut session = Session { client: "agent".into() };
+pub fn serve(input: impl BufRead, output: impl Write) -> Result<()> {
+    serve_session(input, output, None)
+}
+
+/// Serve the Git/LaTeX tools together with launcher-authorized native comments.
+pub fn serve_with_native(input: impl BufRead, output: impl Write, native: crate::NativeSession) -> Result<()> {
+    serve_session(input, output, Some(native))
+}
+
+fn serve_session(input: impl BufRead, mut output: impl Write, native: Option<crate::NativeSession>) -> Result<()> {
+    let mut session = Session {
+        client: "agent".into(),
+        native,
+    };
     for line in input.lines() {
         let line = line?;
         if line.trim().is_empty() {

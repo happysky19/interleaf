@@ -108,10 +108,41 @@ limits are in `src/rules.toml`.
 
 - Every commit says which agent made it, for whom, and in which mode (`Agent: claude-code for Your Name`).
   In Overleaf's own history it appears under the token owner.
-- Overleaf comments and Overleaf's track changes are not visible through git. Suggestion mode is
-  the replacement.
+- Overleaf comments and Track Changes are not carried by Git. Suggestion mode uses LaTeX
+  markup; the development native comment backend is described below.
 - Before submission, accept or reject all suggestions. `check` reports any that are left.
   Then delete the suggestion block from the preamble.
 - interleaf keeps its build output, review PDFs and figure sources in the clone's `.git/interleaf/`.
 - Tests: `cargo test`. The end-to-end test runs against a local bare repository that stands in for
   the remote, with a second clone acting as the co-author.
+
+## Native Overleaf comments (development)
+
+The `dev/native-overleaf` branch adds native `native_list_comments`,
+`native_read_comment_thread` and `native_reply_comment` tools. They appear only
+when the launcher injects an Overleaf session. Every call requires an explicit
+`project_id`, so several papers can share one Fridica channel.
+
+For example, read a review thread with:
+
+```json
+{"project_id": "0123456789abcdef01234567", "thread_id": "abcdef0123456789abcdef01"}
+```
+
+A reply also takes `content` and a stable `operation_id` UUID. Reuse that UUID
+when checking the result. The backend saves an attempt before posting and reads
+the reply back before reporting it confirmed. A lost response stays uncertain;
+it never silently submits the reply again. Read the thread to reconcile it.
+
+**For launcher integration:** keep login, account/project authorization and saved
+credentials in Fridica. Pass its existing `{baseUrl,cookie}` JSON envelope through
+an anonymous Unix socket in `OL_SESSION_FD`, and set `INTERLEAF_NATIVE_RECEIPTS`
+to a private worker-state directory outside the paper checkout. The socket is
+consumed and closed on startup. Rust embedders can use `NativeSession::from_reader`
+and `serve_with_native` instead. The current origin is `https://www.overleaf.com`.
+No browser, Node process, cookie file or Git credential is used by this backend.
+
+This is the first development slice. Anchored comment creation and native Track
+Changes are still pending; the running Fridica integration continues to use its
+existing backend until those operations and its policy attachment are complete.
+The existing Git and LaTeX tools keep working without a native session.
