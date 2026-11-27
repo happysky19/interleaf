@@ -1,3 +1,4 @@
+mod build;
 mod edits;
 mod socket;
 // Native Overleaf collaboration. Login and project authorization belong to the launcher.
@@ -20,6 +21,7 @@ pub struct NativeSession {
     origin: String,
     cookie: String,
     receipts: PathBuf,
+    identity: Option<(String, String)>,
 }
 
 fn need<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
@@ -86,7 +88,16 @@ impl NativeSession {
             origin: envelope.base_url,
             cookie: envelope.cookie,
             receipts,
+            identity: None,
         })
+    }
+
+    /// Bind the session to the launcher-verified account, checked on every call.
+    pub fn with_identity(mut self, account_id: &str, email: &str) -> Result<Self> {
+        id(account_id)?;
+        ensure!(!email.is_empty() && email.len() <= 254, "invalid expected account");
+        self.identity = Some((account_id.into(), email.to_ascii_lowercase()));
+        Ok(self)
     }
 
     /// Consume the anonymous Unix socket passed in OL_SESSION_FD. No unsafe code,
@@ -129,6 +140,7 @@ impl NativeSession {
             "native_read_comment_thread" => &["project_id", "thread_id"],
             "native_reply_comment" => &["project_id", "thread_id", "content", "operation_id"],
             "native_read_file" => &["project_id", "path"],
+            "native_compile" => &["project_id", "path", "engine"],
             "native_list_tracked_changes" => &["project_id", "path"],
             "native_suggest_edit" => &[
                 "project_id",
@@ -229,6 +241,7 @@ impl NativeSession {
         }
         let mut client = Client::new(self, project)?;
         let value = match name {
+            "native_compile" => build::compile(&mut client, self, args)?,
             "native_list_comments" => {
                 let threads = client.threads()?;
                 client.list(args, &threads)?
@@ -268,6 +281,7 @@ pub(crate) fn definitions() -> Vec<Value> {
         ("native_list_comments","Read native review threads and quoted anchors. Open, anchored threads by default.",json!({"project_id":project,"include_resolved":{"type":"boolean"},"include_orphaned":{"type":"boolean"},"full":{"type":"boolean"}}),vec!["project_id"],true),
         ("native_read_comment_thread","Read all messages, authors and timestamps in one native review thread.",json!({"project_id":project,"thread_id":thread}),vec!["project_id","thread_id"],true),
         ("native_reply_comment","Reply once to an existing native thread. Uncertain writes are never resubmitted.",json!({"project_id":project,"thread_id":thread,"content":{"type":"string"},"operation_id":operation}),vec!["project_id","thread_id","content","operation_id"],false),
+        ("native_compile","Compile a fresh native project snapshot with live text versions and source hashes; never publish changes. Requires local latexmk and a TeX engine.",json!({"project_id":project,"path":path,"engine":{"type":"string","enum":["pdflatex","xelatex","lualatex"]}}),vec!["project_id","path"],true),
         ("native_read_file","Read current live text and native document version before proposing an edit or anchor.",json!({"project_id":project,"path":path}),vec!["project_id","path"],true),
         ("native_list_tracked_changes","Read the complete pending Track Changes inventory. Optional path selects one document; no changes are accepted or rejected.",json!({"project_id":project,"path":path}),vec!["project_id"],true),
         ("native_suggest_edit","Suggest one exact replacement as pending Track Changes. Checks expected_version, preserves existing suggestions and verifies readback. Uncertain writes are never replayed.",json!({"project_id":project,"path":path,"old_string":{"type":"string","minLength":1},"new_string":{"type":"string"},"occurrence":occurrence,"expected_version":version,"operation_id":operation,"track":{"type":"string","const":"on"},"strict_version":{"type":"boolean","const":true}}),vec!["project_id","path","old_string","new_string","expected_version","operation_id"],false),
@@ -344,6 +358,15 @@ impl Client {
             .ok_or_else(|| anyhow!("native account missing"))?
             .to_owned();
         id(&client.account)?;
+        if let Some((account, email)) = &session.identity {
+            ensure!(
+                client.account == *account
+                    && user["email"]
+                        .as_str()
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(email)),
+                "native account does not match the saved login"
+            );
+        }
         client.csrf = meta(&page, "ol-csrfToken")?;
         ensure!(
             !client.csrf.is_empty() && client.csrf.len() <= 1024 && client.csrf.bytes().all(|b| (33..127).contains(&b)),
@@ -872,6 +895,7 @@ mod tests {
                 origin: self.origin.clone(),
                 cookie: COOKIE.into(),
                 receipts: receipts.to_owned(),
+                identity: None,
             }
         }
     }
@@ -975,11 +999,9 @@ mod tests {
                 session.is_ok(),
                 payload["baseUrl"] == "https://www.overleaf.com" && payload["cookie"] == COOKIE
             );
+            writer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
             let mut buffer = [0u8; 1];
-            assert_eq!(
-                nix::sys::socket::recv(fd, &mut buffer, nix::sys::socket::MsgFlags::MSG_DONTWAIT),
-                Err(nix::errno::Errno::EBADF)
-            );
+            assert_eq!(writer.read(&mut buffer).unwrap(), 0, "session socket remained open");
         }
         assert_eq!(
             std::fs::read_dir(root.path()).unwrap().count(),
@@ -1009,6 +1031,46 @@ mod tests {
             };
             assert!(native.call(name, args.as_object().unwrap()).is_err());
         }
+        assert_eq!(f.posts.load(Ordering::SeqCst), 0);
+        let wrong_account = f
+            .session(&root.path().join("receipts"))
+            .with_identity("555555555555555555555555", "owner@example.invalid")
+            .unwrap();
+        assert!(
+            wrong_account
+                .call(
+                    "native_list_comments",
+                    json!({"project_id":PROJECT}).as_object().unwrap()
+                )
+                .is_err()
+        );
+        let input = [
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"push","arguments":{}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"native_list_comments","arguments":{"project_id":PROJECT}}}),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n";
+        let mut output = Vec::new();
+        crate::serve_native(
+            input.as_bytes(),
+            &mut output,
+            f.session(&root.path().join("receipts")),
+            |_, _| bail!("fixture task expired"),
+        )
+        .unwrap();
+        let responses: Vec<Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            responses[0]["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool["name"].as_str().unwrap().starts_with("native_"))
+        );
+        assert_eq!(responses[1]["result"]["isError"], true);
+        assert_eq!(responses[2]["result"]["isError"], true);
         assert_eq!(f.posts.load(Ordering::SeqCst), 0);
         rpc(
             f.session(&root.path().join("receipts")),

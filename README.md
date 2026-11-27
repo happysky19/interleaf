@@ -109,7 +109,7 @@ limits are in `src/rules.toml`.
 - Every commit says which agent made it, for whom, and in which mode (`Agent: claude-code for Your Name`).
   In Overleaf's own history it appears under the token owner.
 - Overleaf comments and Track Changes are not carried by Git. Suggestion mode uses LaTeX
-  markup; the development native comment backend is described below.
+  markup; the development native backend is described below.
 - Before submission, accept or reject all suggestions. `check` reports any that are left.
   Then delete the suggestion block from the preamble.
 - interleaf keeps its build output, review PDFs and figure sources in the clone's `.git/interleaf/`.
@@ -118,7 +118,9 @@ limits are in `src/rules.toml`.
 
 ## Native Overleaf collaboration (development)
 
-This branch adds seven native tools alongside the existing Git and LaTeX tools:
+This branch provides native collaboration in Rust. Fridica uses these eight tools
+without the separate `overleaf-mcp-native` package, Node, or a Python adapter.
+The standalone Git tools remain available through their own entry point:
 
 | Tool | Use |
 | --- | --- |
@@ -126,6 +128,7 @@ This branch adds seven native tools alongside the existing Git and LaTeX tools:
 | `native_read_comment_thread` | Read every message in a thread |
 | `native_reply_comment` | Reply to an existing thread |
 | `native_read_file` | Read current text and its native version |
+| `native_compile` | Compile a fresh text/version snapshot and exported assets |
 | `native_list_tracked_changes` | Read the complete pending-change inventory |
 | `native_suggest_edit` | Propose one exact replacement as pending Track Changes |
 | `native_add_comment` | Create a comment anchored to exact quoted text |
@@ -164,15 +167,29 @@ or incomplete readback returns an MCP error with `state: "uncertain"`, safe IDs
 and reconciliation details. Read the file, pending changes or comment thread
 before further work. A partial comment thread is retained for inspection.
 
-**For launcher integration:** Fridica keeps login, account/project authorization
-and saved credentials. Pass its existing `{baseUrl,cookie}` JSON envelope through
-an anonymous Unix socket in `OL_SESSION_FD`, and set `INTERLEAF_NATIVE_RECEIPTS`
-to private worker state outside the paper checkout. The socket is consumed and
-closed on startup. Rust embedders can use `NativeSession::from_reader` and
-`serve_with_native`. The supported origin is `https://www.overleaf.com`; the
-native backend needs no Node process, browser, cookie file or Git credential.
+For Fridica, sign in once on the owner machine:
 
-The native tools appear only with an injected session. This development branch
-has not replaced Fridica's running backend; its policy/packaging attachment and
-live-account acceptance remain separate steps. No native accept/reject or
-untracked text-write tool is exposed.
+```sh
+fridica overleaf-auth login --expected-email owner@example.com
+```
+
+Fridica reuses its existing OS-store session and verifies the account. Only a missing
+or explicitly expired session opens an isolated Chrome/Chromium window. There is no
+project-to-channel setup: name the paper URL in each task; several papers can share
+a channel. Existing account/project/channel/recipient restrictions remain in force.
+
+Rust embedders use `login` for owner-driven authentication,
+`NativeSession::from_reader(...).with_identity(...)` for an in-memory session, and
+`serve_native` with a per-call authorization callback for native-only tools.
+`serve_with_native` additionally exposes the independent Git tools. The native
+origin is fixed to `https://www.overleaf.com`.
+
+`native_compile` records live text versions and hashes, exports binary assets,
+then verifies the text again. It retains a PDF only for a current successful build.
+Assets are not certified as an atomic Overleaf snapshot, and local TeX/fonts may
+differ. Compile success does not imply a warning-free build.
+
+This development source has not replaced Fridica's running release. Deployment
+and live-account acceptance are separate. Native accept/reject and untracked text
+writes are not exposed. Keep receipts when migrating execution machines; this
+branch never automatically resubmits an uncertain operation.

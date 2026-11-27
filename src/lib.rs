@@ -5,6 +5,7 @@
 //! suggestions a co-author accepts or rejects, and checks what an agent wrote.
 mod cite;
 mod config;
+pub mod login;
 mod native;
 mod numbers;
 mod review;
@@ -16,4 +17,4 @@ mod tex;
 mod text;
 
 pub use native::NativeSession;
-pub use server::{INSTRUCTIONS, VERSION, serve, serve_with_native};
+pub use server::{INSTRUCTIONS, VERSION, serve, serve_native, serve_with_native};

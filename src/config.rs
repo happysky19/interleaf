@@ -81,12 +81,15 @@ impl Token {
 
     /// A git credential helper that reads the token when git asks for it, so the token never
     /// appears in arguments, URLs or git config.
-    pub fn helper(&self) -> String {
-        let value = match env(self.env) {
-            Some(_) => format!("${}", self.env),
-            None => format!("$({})", self.lookup().join(" ")),
-        };
-        format!(r#"!f() {{ test "$1" = get || return 0; echo username=git; echo "password={value}"; }}; f"#)
+    pub fn helper(&self, project_id: &str) -> Result<String> {
+        if !re!(r"^[0-9a-f]{24}$").is_match(project_id) {
+            bail!("invalid Overleaf project id for Git credentials");
+        }
+        let lookup = self.lookup().join(" ");
+        Ok(format!(
+            r#"!f() {{ test "$1" = get || return 0; protocol= host= path=; while IFS='=' read -r key value; do test -n "$key" || break; case "$key" in protocol) protocol=$value;; host) host=$value;; path) path=$value;; esac; done; test "$protocol" = https && test "$host" = git.overleaf.com && ( test "$path" = {project_id} || test "$path" = {project_id}.git ) || return 0; token="${{{env}:-}}"; if test -z "$token"; then token="$({lookup})" || return 0; fi; test -n "$token" || return 0; printf '%s\n' username=git "password=$token"; }}; f"#,
+            env = self.env
+        ))
     }
 }
 
@@ -160,7 +163,9 @@ impl Project {
 
     /// Overleaf over https uses the Overleaf token; any other remote uses the user's git login.
     pub fn overleaf_https(&self) -> bool {
-        self.id.is_some() && self.git_url.starts_with("https://")
+        self.id
+            .as_ref()
+            .is_some_and(|id| self.git_url == format!("https://git.overleaf.com/{id}"))
     }
 
     /// What people call the shared copy.
@@ -206,26 +211,44 @@ fn workspace() -> PathBuf {
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").current_dir(dir).args(args).output().ok()?;
+    let out = crate::text::git_command().current_dir(dir).args(args).output().ok()?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     (out.status.success() && !v.is_empty()).then_some(v)
 }
 
-fn same_remote(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.trim_end_matches('/').trim_end_matches(".git").to_owned();
-    norm(a) == norm(b)
+pub(crate) fn same_remote(a: &str, b: &str) -> bool {
+    match (remote(a), remote(b)) {
+        (Some((Some(_), ca)), Some((Some(_), cb))) => ca == cb,
+        _ => a.trim_end_matches('/') == b.trim_end_matches('/'),
+    }
 }
 
 /// An Overleaf id, or a git URL, read from what the user gave.
 fn remote(s: &str) -> Option<(Option<String>, String)> {
-    if let Some(c) = re!(r"^([0-9a-f]{24})$|overleaf\.com/(?:project/)?([0-9a-f]{24})").captures(s) {
-        let id = c.get(1).or(c.get(2)).unwrap().as_str().to_owned();
-        let url = if s.starts_with("https://git.") || s.starts_with("http://") {
-            s.to_owned()
-        } else {
-            format!("https://git.overleaf.com/{id}")
-        };
-        return Some((Some(id), url));
+    if re!(r"^[0-9a-f]{24}$").is_match(s) {
+        return Some((Some(s.to_owned()), format!("https://git.overleaf.com/{s}")));
+    }
+    if let Ok(uri) = s.parse::<ureq::http::Uri>() {
+        let host = uri.host().unwrap_or("");
+        if ["overleaf.com", "www.overleaf.com", "git.overleaf.com"].contains(&host) {
+            if uri.scheme_str() != Some("https")
+                || uri.port_u16().is_some()
+                || uri.query().is_some()
+                || uri.authority()?.as_str() != host
+            {
+                return None;
+            }
+            let path = uri.path().trim_end_matches('/');
+            let id = if host == "git.overleaf.com" {
+                path.strip_prefix('/')?.trim_end_matches(".git")
+            } else {
+                path.strip_prefix("/project/")?
+            };
+            if !re!(r"^[0-9a-f]{24}$").is_match(id) {
+                return None;
+            }
+            return Some((Some(id.to_owned()), format!("https://git.overleaf.com/{id}")));
+        }
     }
     let git =
         s.contains("://") || re!(r"^[\w.-]+@[\w.-]+:").is_match(s) || s.ends_with(".git") || Path::new(s).is_dir();
@@ -365,8 +388,91 @@ pub fn project(arg: Option<&str>) -> Result<Project> {
     let Some(git_url) = git_url else {
         bail!("project {name}: give an Overleaf id or a git_url")
     };
+    let git_url = if let Some(id) = &id {
+        let (actual, canonical) = remote(&git_url).ok_or_else(|| anyhow!("invalid Overleaf Git URL"))?;
+        if actual.as_ref() != Some(id) {
+            bail!("configured Overleaf id does not match Git URL");
+        }
+        canonical
+    } else {
+        git_url
+    };
     let dir = get("dir")
         .map(|d| expand(&d))
         .unwrap_or_else(|| workspace().join(&name));
     Ok(make(&name, id, git_url, dir, entry, &who))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_only_real_overleaf_urls() {
+        let id = "0123456789abcdef01234567";
+        assert_eq!(
+            remote(&format!("https://www.overleaf.com/project/{id}"))
+                .unwrap()
+                .0
+                .as_deref(),
+            Some(id)
+        );
+        assert!(
+            remote(&format!("https://git.attacker.invalid/overleaf.com/project/{id}"))
+                .unwrap()
+                .0
+                .is_none()
+        );
+        assert!(remote(&format!("http://git.overleaf.com/{id}")).is_none());
+        assert!(!same_remote("/tmp/paper", "/tmp/paper.git"));
+    }
+
+    #[test]
+    fn credential_helper_refuses_other_hosts() {
+        let token = Token {
+            env: "PATH",
+            service: "unused",
+            what: "test",
+        };
+        for (protocol, host, path, allowed) in [
+            ("https", "git.overleaf.com", "0123456789abcdef01234567", true),
+            ("https", "git.overleaf.com", "0123456789abcdef01234567.git", true),
+            ("https", "attacker.invalid", "0123456789abcdef01234567", false),
+            ("http", "git.overleaf.com", "0123456789abcdef01234567", false),
+            ("https", "git.overleaf.com", "1123456789abcdef01234567", false),
+        ] {
+            let mut child = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "{} get",
+                        token
+                            .helper("0123456789abcdef01234567")
+                            .unwrap()
+                            .trim_start_matches('!')
+                    ),
+                ])
+                .env("PATH", "dummy-token")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(format!("protocol={protocol}\nhost={host}\npath={path}\n\n").as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert_eq!(
+                String::from_utf8(out.stdout).unwrap(),
+                if allowed {
+                    "username=git\npassword=dummy-token\n"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
 }

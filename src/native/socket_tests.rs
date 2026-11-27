@@ -91,6 +91,7 @@ impl World {
     }
     fn call(&self, tool: &str, args: Value) -> Result<Value> {
         let native = NativeSession {
+            identity: None,
             origin: self.origin.clone(),
             cookie: "overleaf_session2=fixture-session".into(),
             receipts: self.root.path().join("receipts"),

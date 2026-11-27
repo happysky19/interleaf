@@ -3,10 +3,11 @@
 use crate::text::{self, env_spans, group, head, re, read, strip_comment, tail};
 use anyhow::{Result, bail};
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 pub const GFX_EXT: [&str; 5] = [".pdf", ".png", ".jpg", ".jpeg", ".eps"];
 
@@ -570,7 +571,29 @@ fn file_at(log: &str, pos: usize, files: &HashSet<String>) -> String {
         .to_owned()
 }
 
-pub fn compile(root: &Path, main: &str, outdir: &Path, engine: &str) -> Result<String> {
+pub struct Build {
+    pub report: String,
+    pub success: bool,
+    pub clean: bool,
+    pub pdf: Option<PathBuf>,
+}
+
+fn source_hash(root: &Path) -> Result<String> {
+    let mut hash = Sha256::new();
+    for file in text::walk(root).1 {
+        let name = text::rel(&file);
+        let data = std::fs::read(root.join(file))?;
+        hash.update((name.len() as u64).to_be_bytes());
+        hash.update(name.as_bytes());
+        hash.update((data.len() as u64).to_be_bytes());
+        hash.update(data);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+pub fn compile(root: &Path, main: &str, outdir: &Path, engine: &str) -> Result<Build> {
+    text::project_path(root, Path::new(main))?;
+    let input_hash = source_hash(root)?;
     let (dirs, files) = text::walk(root);
     std::fs::create_dir_all(outdir)?;
     for d in dirs {
@@ -582,9 +605,29 @@ pub fn compile(root: &Path, main: &str, outdir: &Path, engine: &str) -> Result<S
         "lualatex" => "-lualatex",
         _ => bail!("engine must be pdflatex, xelatex or lualatex"),
     };
-    let (t0, wall) = (Instant::now(), SystemTime::now());
-    let p = Command::new("latexmk")
-        .args([flag, "-interaction=nonstopmode", "-file-line-error", "-synctex=1"])
+    let stem = Path::new(main)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    // Old artifacts must not certify this invocation if TeX fails before producing output.
+    for suffix in ["pdf", "log", "blg"] {
+        let path = outdir.join(format!("{stem}.{suffix}"));
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+    }
+    let t0 = Instant::now();
+    let mut command = Command::new("latexmk");
+    command
+        .args([
+            "-norc",
+            "-latexoption=-no-shell-escape",
+            flag,
+            "-interaction=nonstopmode",
+            "-file-line-error",
+            "-synctex=1",
+        ])
         .arg(format!("-outdir={}", outdir.display()))
         .arg(main)
         .current_dir(root)
@@ -593,20 +636,15 @@ pub fn compile(root: &Path, main: &str, outdir: &Path, engine: &str) -> Result<S
             ("error_line", "254"),
             ("half_error_line", "238"),
         ])
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    text::scrub_build_env(&mut command);
+    let p = command
         .output()
         .map_err(|e| anyhow::anyhow!("cannot run latexmk ({e}); install TeX Live"))?;
-    let stem = Path::new(main)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
+    let same_source = input_hash == source_hash(root)?;
     let log = read(&outdir.join(format!("{stem}.log"))).unwrap_or_default();
     let pdf = outdir.join(format!("{stem}.pdf"));
-    let fresh = pdf
-        .metadata()
-        .and_then(|m| m.modified())
-        .is_ok_and(|t| t >= wall - std::time::Duration::from_secs(1));
+    let fresh = pdf.is_file() && same_source;
     let files: HashSet<String> = files.iter().map(|f| text::rel(f)).collect();
     let mut errors = vec![];
     for c in re!(r"(?m)^(\.?/?[^:\n]+\.(?:tex|sty|cls|bbl)):(\d+): (.*)$").captures_iter(&log) {
@@ -675,7 +713,9 @@ pub fn compile(root: &Path, main: &str, outdir: &Path, engine: &str) -> Result<S
         .captures(&log)
         .map(|c| format!(", {} pages", &c[1]))
         .unwrap_or_default();
-    let state = if p.status.success() && errors.is_empty() {
+    let success = p.status.success() && errors.is_empty() && fresh;
+    let clean = success && undef.is_empty() && bib.is_empty() && over.is_empty() && warns.is_empty();
+    let state = if success {
         "ok"
     } else if fresh {
         "errors"
@@ -684,6 +724,15 @@ pub fn compile(root: &Path, main: &str, outdir: &Path, engine: &str) -> Result<S
     };
     let mut out = vec![
         format!("{state} ({engine}, {} s)", t0.elapsed().as_secs()),
+        format!("build_status: {}", if success { "succeeded" } else { "failed" }),
+        format!("clean: {clean}"),
+        format!(
+            "exit_code: {}",
+            p.status.code().map_or("signal".into(), |c| c.to_string())
+        ),
+        "source_scope: local working tree; regular project files, no native-version certificate".into(),
+        format!("source_tree_sha256: {input_hash}"),
+        format!("main: {main}"),
         format!(
             "pdf: {}{pages}",
             if fresh {
@@ -707,6 +756,9 @@ pub fn compile(root: &Path, main: &str, outdir: &Path, engine: &str) -> Result<S
             out.extend(items.iter().take(n).map(|x| format!("  {x}")));
         }
     }
+    if !same_source {
+        out.push("source changed during compilation; output is not certified".into());
+    }
     if !fresh {
         let all = format!(
             "{}{}",
@@ -715,5 +767,10 @@ pub fn compile(root: &Path, main: &str, outdir: &Path, engine: &str) -> Result<S
         );
         out.push(format!("\n{}", tail(&all, 1500)));
     }
-    Ok(out.join("\n"))
+    Ok(Build {
+        report: out.join("\n"),
+        success,
+        clean,
+        pdf: fresh.then_some(pdf),
+    })
 }

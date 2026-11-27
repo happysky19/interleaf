@@ -18,7 +18,7 @@ pub(super) fn path(value: &str) -> Result<()> {
     );
     Ok(())
 }
-fn documents(project: &Value) -> Result<BTreeMap<String, String>> {
+pub(super) fn documents(project: &Value) -> Result<BTreeMap<String, String>> {
     fn walk(
         folder: &Value,
         prefix: &str,
