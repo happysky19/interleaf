@@ -92,6 +92,9 @@ impl World {
     fn call(&self, tool: &str, args: Value) -> Result<Value> {
         let native = NativeSession {
             identity: None,
+            upload_roots: Vec::new(),
+            projects: None,
+            operations: None,
             origin: self.origin.clone(),
             cookie: "overleaf_session2=fixture-session".into(),
             receipts: self.root.path().join("receipts"),
@@ -146,7 +149,7 @@ fn connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
             let values = match event["name"].as_str().unwrap() {
                 "joinProject" => {
                     assert_eq!(event["args"][0]["project_id"], PROJECT);
-                    let project = json!({"_id":PROJECT,"features":{"trackChanges":s.tracking},"rootFolder":[{"docs":[{"_id":DOC,"name":"main.tex"}],"folders":[]} ]});
+                    let project = json!({"_id":PROJECT,"features":{"trackChanges":s.tracking},"rootFolder":[{"_id":"777777777777777777777777","docs":[{"_id":DOC,"name":"main.tex"}],"folders":[],"fileRefs":[]} ]});
                     if s.mode == Mode::Normal {
                         ws.send(Message::text(format!("5:::{}",json!({"name":"joinProjectResponse","args":[{"project":project,"permissionsLevel":"readAndWrite"}]})))).unwrap();
                         continue;

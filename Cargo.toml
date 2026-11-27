@@ -1,6 +1,6 @@
 [package]
 name = "interleaf"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.89"
 description = "MCP server for LaTeX papers written by people and agents together, on Overleaf or any git remote"
@@ -11,6 +11,8 @@ keywords = ["latex", "overleaf", "mcp", "agent", "git"]
 categories = ["command-line-utilities", "text-processing"]
 
 [dependencies]
+base64 = "0.23"
+percent-encoding = "2"
 anyhow = "1.0.104"
 regex = "1.13.2"
 serde = { version = "1.0.229", features = ["derive"] }

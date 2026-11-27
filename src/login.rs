@@ -14,6 +14,28 @@ use std::{
 use tungstenite::{Message, WebSocket};
 
 const ORIGIN: &str = "https://www.overleaf.com";
+/// Normalize an explicitly configured Overleaf origin. Plain HTTP is loopback-only.
+pub fn normalize_base_url(value: &str) -> Result<String> {
+    let uri: ureq::http::Uri = value.parse().map_err(|_| anyhow!("invalid Overleaf base URL"))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| anyhow!("Overleaf base URL needs a scheme"))?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| anyhow!("Overleaf base URL needs a host"))?;
+    let host = uri.host().ok_or_else(|| anyhow!("Overleaf base URL needs a host"))?;
+    let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]");
+    ensure!(
+        (scheme == "https" || (scheme == "http" && loopback))
+            && !authority.as_str().contains('@')
+            && uri.query().is_none()
+            && matches!(uri.path(), "" | "/")
+            && value.len() <= 512,
+        "Overleaf base URL must be an HTTPS origin (HTTP is allowed only on loopback)"
+    );
+    Ok(format!("{scheme}://{}", authority.as_str().to_ascii_lowercase()))
+}
+
 const BODY_LIMIT: u64 = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -54,14 +76,33 @@ pub fn validate_cookie(cookie: &str, project: Option<&str>) -> std::result::Resu
     validate(cookie, project, REQUEST_TIMEOUT)
 }
 
+/// Validate only against the owner-configured origin; never follow login redirects.
+pub fn validate_cookie_at(
+    base_url: &str,
+    cookie: &str,
+    project: Option<&str>,
+) -> std::result::Result<Identity, ValidationError> {
+    validate_on(base_url, cookie, project, REQUEST_TIMEOUT)
+}
+
 fn validate(cookie: &str, project: Option<&str>, timeout: Duration) -> std::result::Result<Identity, ValidationError> {
+    validate_on(ORIGIN, cookie, project, timeout)
+}
+
+fn validate_on(
+    base_url: &str,
+    cookie: &str,
+    project: Option<&str>,
+    timeout: Duration,
+) -> std::result::Result<Identity, ValidationError> {
+    let origin = normalize_base_url(base_url).map_err(|_| ValidationError::Rejected)?;
     check_cookie(cookie)?;
     if project.is_some_and(|value| !id(value)) {
         return Err(ValidationError::Rejected);
     }
     let url = project.map_or_else(
-        || format!("{ORIGIN}/project"),
-        |value| format!("{ORIGIN}/project/{value}"),
+        || format!("{origin}/project"),
+        |value| format!("{origin}/project/{value}"),
     );
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
@@ -78,7 +119,8 @@ fn validate(cookie: &str, project: Option<&str>, timeout: Duration) -> std::resu
         .header("Accept", "text/html")
         .call()
         .map_err(|_| ValidationError::Unavailable)?;
-    status(
+    status_on(
+        &origin,
         response.status().as_u16(),
         response.headers().get("location").and_then(|v| v.to_str().ok()),
     )?;
@@ -96,7 +138,11 @@ fn validate(cookie: &str, project: Option<&str>, timeout: Duration) -> std::resu
     parse_identity(&page, project)
 }
 
+#[cfg(test)]
 fn status(code: u16, location: Option<&str>) -> std::result::Result<(), ValidationError> {
+    status_on(ORIGIN, code, location)
+}
+fn status_on(origin: &str, code: u16, location: Option<&str>) -> std::result::Result<(), ValidationError> {
     match code {
         401 => Err(ValidationError::Expired),
         300..=399 => {
@@ -105,7 +151,7 @@ fn status(code: u16, location: Option<&str>) -> std::result::Result<(), Validati
                 .is_some_and(|uri| {
                     let origin_ok = match (uri.scheme_str(), uri.authority()) {
                         (None, None) => uri.path().starts_with('/') && !uri.path().starts_with("//"),
-                        (Some("https"), Some(authority)) => authority.as_str() == "www.overleaf.com",
+                        (Some(scheme), Some(authority)) => format!("{scheme}://{authority}") == origin,
                         _ => false,
                     };
                     origin_ok && matches!(uri.path(), "/login" | "/login/")
@@ -209,6 +255,19 @@ pub fn capture_session(
     browser: Option<&Path>,
     timeout: Duration,
 ) -> Result<CapturedSession> {
+    capture_session_at(ORIGIN, expected_email, project, browser, timeout)
+}
+
+/// Owner-driven login against an explicit cloud or self-hosted origin.
+#[cfg(unix)]
+pub fn capture_session_at(
+    base_url: &str,
+    expected_email: &str,
+    project: Option<&str>,
+    browser: Option<&Path>,
+    timeout: Duration,
+) -> Result<CapturedSession> {
+    let origin = normalize_base_url(base_url)?;
     ensure!(email(expected_email), "expected Overleaf email is invalid");
     ensure!(project.is_none_or(id), "Overleaf project ID is invalid");
     ensure!(!timeout.is_zero(), "browser login timeout must be positive");
@@ -217,11 +276,11 @@ pub fn capture_session(
         .ok_or_else(|| anyhow!("browser login timeout is invalid"))?;
     let executable = browser_path(browser)?;
     let target = project.map_or_else(
-        || format!("{ORIGIN}/login?redir=%2Fproject"),
-        |value| format!("{ORIGIN}/login?redir=%2Fproject%2F{value}"),
+        || format!("{origin}/login?redir=%2Fproject"),
+        |value| format!("{origin}/login?redir=%2Fproject%2F{value}"),
     );
     let mut browser = Browser::start(&executable, &target)?;
-    let result = browser.capture(expected_email, project, deadline);
+    let result = browser.capture(&origin, expected_email, project, deadline);
     let cleanup = browser.close();
     match result {
         Err(error) => Err(error),
@@ -234,6 +293,11 @@ pub fn capture_session(
 
 #[cfg(not(unix))]
 pub fn capture_session(_: &str, _: Option<&str>, _: Option<&Path>, _: Duration) -> Result<CapturedSession> {
+    bail!("owner browser login is supported on macOS and Linux")
+}
+
+#[cfg(not(unix))]
+pub fn capture_session_at(_: &str, _: &str, _: Option<&str>, _: Option<&Path>, _: Duration) -> Result<CapturedSession> {
     bail!("owner browser login is supported on macOS and Linux")
 }
 
@@ -269,7 +333,14 @@ fn browser_path(requested: Option<&Path>) -> Result<PathBuf> {
     bail!("Chrome or Chromium executable was not found")
 }
 
+#[cfg(test)]
 fn cookies(values: &Value) -> Result<Option<String>> {
+    cookies_at(values, ORIGIN)
+}
+fn cookies_at(values: &Value, origin: &str) -> Result<Option<String>> {
+    let uri: ureq::http::Uri = origin.parse()?;
+    let host = uri.host().ok_or_else(|| anyhow!("browser cookie origin missing"))?;
+    let secure = uri.scheme_str() == Some("https");
     let values = values
         .as_array()
         .ok_or_else(|| anyhow!("browser cookie response is invalid"))?;
@@ -283,13 +354,13 @@ fn cookies(values: &Value) -> Result<Option<String>> {
         let Some(name @ ("overleaf_session2" | "GCLB")) = value["name"].as_str() else {
             continue;
         };
-        if !matches!(
-            value["domain"].as_str(),
-            Some("www.overleaf.com" | ".www.overleaf.com" | ".overleaf.com")
-        ) {
-            continue;
-        }
-        if value["path"] != "/" || value["secure"] != true {
+        let domain = value["domain"].as_str().unwrap_or("");
+        let matches = if let Some(domain) = domain.strip_prefix('.') {
+            host == domain || host.ends_with(&format!(".{domain}"))
+        } else {
+            host == domain
+        };
+        if !matches || value["path"] != "/" || (secure && value["secure"] != true) {
             continue;
         }
         let live = value["session"] == true || value["expires"].as_f64().is_some_and(|expires| expires > now);
@@ -482,7 +553,13 @@ impl Browser {
         );
         Ok(Some(format!("ws://127.0.0.1:{port}{path}")))
     }
-    fn capture(&mut self, expected_email: &str, project: Option<&str>, deadline: Instant) -> Result<CapturedSession> {
+    fn capture(
+        &mut self,
+        origin: &str,
+        expected_email: &str,
+        project: Option<&str>,
+        deadline: Instant,
+    ) -> Result<CapturedSession> {
         let endpoint = loop {
             self.running()?;
             remaining(deadline)?;
@@ -495,8 +572,8 @@ impl Browser {
         loop {
             self.running()?;
             remaining(deadline)?;
-            if let Some(cookie) = cookies(&cdp.cookies(deadline)?)? {
-                match validate(&cookie, project, remaining(deadline)?.min(REQUEST_TIMEOUT)) {
+            if let Some(cookie) = cookies_at(&cdp.cookies(deadline)?, origin)? {
+                match validate_on(origin, &cookie, project, remaining(deadline)?.min(REQUEST_TIMEOUT)) {
                     Ok(identity) => {
                         ensure!(
                             identity.email.eq_ignore_ascii_case(expected_email),
@@ -607,6 +684,24 @@ mod tests {
         assert_eq!(status(403, None), Err(ValidationError::Rejected));
         assert_eq!(status(503, None), Err(ValidationError::Unavailable));
         assert_eq!(status(200, None), Ok(()));
+        assert_eq!(
+            normalize_base_url("https://latex.example/").unwrap(),
+            "https://latex.example"
+        );
+        assert!(normalize_base_url("https://latex.example/project").is_err());
+        assert!(normalize_base_url("http://latex.example").is_err());
+        assert_eq!(
+            normalize_base_url("http://127.0.0.1:3000").unwrap(),
+            "http://127.0.0.1:3000"
+        );
+        assert_eq!(
+            status_on("https://latex.example", 302, Some("https://latex.example/login")),
+            Err(ValidationError::Expired)
+        );
+        assert_eq!(
+            status_on("https://latex.example", 302, Some("https://www.overleaf.com/login")),
+            Err(ValidationError::Rejected)
+        );
     }
 
     #[test]

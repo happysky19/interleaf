@@ -13,6 +13,7 @@ const TIMEOUT: Duration = Duration::from_secs(8);
 pub(super) struct Snapshot {
     pub text: String,
     pub version: u64,
+    pub ranges: Value,
 }
 pub(super) struct Socket {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
@@ -67,7 +68,14 @@ impl Client {
             .uri()
             .host()
             .ok_or_else(|| anyhow!("native socket host missing"))?;
-        let port = request.uri().port_u16().unwrap_or(443);
+        let port = request
+            .uri()
+            .port_u16()
+            .unwrap_or(if request.uri().scheme_str() == Some("ws") {
+                80
+            } else {
+                443
+            });
         let addresses = (host, port)
             .to_socket_addrs()
             .map_err(|_| anyhow!("native socket DNS failed"))?;
@@ -258,7 +266,11 @@ impl Socket {
             .as_u64()
             .filter(|v| *v <= 9_007_199_254_740_991)
             .ok_or_else(|| anyhow!("invalid native document version"))?;
-        Ok(Snapshot { text, version })
+        Ok(Snapshot {
+            text,
+            version,
+            ranges: values[4].clone(),
+        })
     }
     pub fn refresh(&mut self, doc: &str) -> Result<Snapshot> {
         self.leave()?;

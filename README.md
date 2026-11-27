@@ -23,8 +23,9 @@ or self-hosted) or in any git repository, such as GitHub or GitLab. One binary, 
 
 ## Setup
 
-Needs git, and TeX Live (`latexmk`, `latexdiff`) for `compile` and `review`. Overleaf projects need
-Overleaf's Git integration.
+The Git workflow below needs git and TeX Live (`latexmk`, `latexdiff`) for `compile` and `review`.
+Overleaf Git projects need Overleaf's Git integration. For editor services without Git, see
+[native Overleaf collaboration](#native-overleaf-collaboration-development).
 
 1. Install: `cargo install interleaf`.
 2. Register it with your client:
@@ -118,78 +119,120 @@ limits are in `src/rules.toml`.
 
 ## Native Overleaf collaboration (development)
 
-This branch provides native collaboration in Rust. Fridica uses these eight tools
-without the separate `overleaf-mcp-native` package, Node, or a Python adapter.
-The standalone Git tools remain available through their own entry point:
+The development Rust backend provides 33 canonical native tools and two
+compatibility helpers. It uses Overleaf's editor services directly, without
+`overleaf-mcp-native`, Node, npm, a Python adapter or a worker browser. The Git
+workflow above remains separate. These source changes do not update a running
+Fridica installation or certify a release.
 
-| Tool | Use |
-| --- | --- |
-| `native_list_comments` | List review threads and their quoted anchors |
-| `native_read_comment_thread` | Read every message in a thread |
-| `native_reply_comment` | Reply to an existing thread |
-| `native_read_file` | Read current text and its native version |
-| `native_compile` | Compile a fresh text/version snapshot and exported assets |
-| `native_list_tracked_changes` | Read the complete pending-change inventory |
-| `native_suggest_edit` | Propose one exact replacement as pending Track Changes |
-| `native_add_comment` | Create a comment anchored to exact quoted text |
+### Login and scope
 
-Name the `project_id` on every call. Several papers can share one Fridica channel.
-Start an edit or anchored comment by reading the live file:
-
-`native_read_file`:
-```json
-{"project_id": "0123456789abcdef01234567", "path": "main.tex"}
-```
-
-Then use its returned `version` as `expected_version`:
-
-`native_suggest_edit`:
-```json
-{
-  "project_id": "0123456789abcdef01234567",
-  "path": "main.tex",
-  "old_string": "the old approximation",
-  "new_string": "the revised approximation",
-  "expected_version": 95,
-  "operation_id": "dcd3d917-b8bc-4c47-83b5-5bfd02567b8c"
-}
-```
-
-Use `occurrence` (1-based) when the quoted text is not unique. Suggestions always
-use tracking and strict version checks. Edits that touch an existing pending
-change are refused. Readback must confirm the predicted text, next version,
-new pending records and preservation of the original records before success.
-
-Each write needs a stable `operation_id` UUID. Keep the ID and arguments unchanged
-when checking an outcome. The backend records the attempt before writing;
-repeated calls only return that receipt. A lost acknowledgement, concurrent edit
-or incomplete readback returns an MCP error with `state: "uncertain"`, safe IDs
-and reconciliation details. Read the file, pending changes or comment thread
-before further work. A partial comment thread is retained for inspection.
-
-For Fridica, sign in once on the owner machine:
+With a matching Fridica development build, the owner signs in once:
 
 ```sh
 fridica overleaf-auth login --expected-email owner@example.com
+# For a self-hosted Overleaf / Community Edition installation:
+fridica overleaf-auth login --base-url https://overleaf.example.org --expected-email owner@example.com
 ```
 
-Fridica reuses its existing OS-store session and verifies the account. Only a missing
-or explicitly expired session opens an isolated Chrome/Chromium window. There is no
-project-to-channel setup: name the paper URL in each task; several papers can share
-a channel. Existing account/project/channel/recipient restrictions remain in force.
+Passwords and MFA stay in the owner's isolated Chrome/Chromium window. Later
+logins reuse the verified session in the OS credential store. The configured
+origin is explicit; a stored session is never silently retargeted to another
+host. Native server operations themselves run in Rust.
 
-Rust embedders use `login` for owner-driven authentication,
-`NativeSession::from_reader(...).with_identity(...)` for an in-memory session, and
-`serve_native` with a per-call authorization callback for native-only tools.
-`serve_with_native` additionally exposes the independent Git tools. The native
-origin is fixed to `https://www.overleaf.com`.
+Existing sessions keep their seven previously authorized operations. The owner
+can opt into the expanded tool capabilities without logging in again:
 
-`native_compile` records live text versions and hashes, exports binary assets,
-then verifies the text again. It retains a PDF only for a current successful build.
-Assets are not certified as an atomic Overleaf snapshot, and local TeX/fonts may
-differ. Compile success does not imply a warning-free build.
+```sh
+fridica overleaf-auth grant --all
+```
 
-This development source has not replaced Fridica's running release. Deployment
-and live-account acceptance are separate. Native accept/reject and untracked text
-writes are not exposed. Keep receipts when migrating execution machines; this
-branch never automatically resubmits an uncertain operation.
+This changes tool capabilities only. It cannot widen the saved account,
+project, channel, recipient or expiry restrictions. Normal task admission,
+approvals and workspace confinement still apply; the command does not deploy
+this branch or activate a listener.
+
+A task may discover projects, search and read while unbound, within its saved
+scope. Every project call names an explicit `project_id`. Before a project
+mutation, Fridica must confirm that project for the requesting thread; changing
+a tool argument does not bind a different paper. Account-level project creation
+requires an unbound task with unrestricted account/project scope.
+
+### Native tools
+
+The names below include the `native_` prefix used by the Rust MCP server.
+
+| Capability | Canonical tools | Behavior |
+| --- | --- | --- |
+| Connection and projects (3) | `native_ping`, `native_list_projects`, `native_open_project` | Check the connection, discover accessible papers and inspect project metadata |
+| Find and read (3) | `native_list_files`, `native_search_project`, `native_read_file` | Navigate the tree, search text, read text/version or binary content |
+| Create and organize (7) | `native_create_project`, `native_create_doc`, `native_create_folder`, `native_upload_file`, `native_rename_entity`, `native_move_entity`, `native_delete_entity` | Create projects and manage project entities; upload paths remain confined |
+| Edit text (2) | `native_edit_file`, `native_find_and_replace` | Minimal full-file diffs or exact replacements; tracking `on`, `off` or `auto` |
+| Comments (9) | `native_list_comments`, `native_read_comment_thread`, `native_reply_comment`, `native_add_comment`, `native_resolve_comment`, `native_reopen_comment`, `native_delete_comment`, `native_edit_comment_message`, `native_delete_comment_message` | Read/filter review threads and manage exact comments/messages |
+| Track Changes (4) | `native_list_tracked_changes`, `native_set_track_changes`, `native_accept_changes`, `native_reject_changes` | Filter pending records, change only your own switch, review precise selections |
+| Cloud build (3) | `native_compile`, `native_read_log`, `native_label_pages` | Request an Overleaf cloud build, inspect its log and locate labels |
+| Native history (2) | `native_list_history`, `native_diff_file` | Inspect Overleaf history and file differences |
+
+The two additional helpers are `native_suggest_edit`, the pending-only exact
+replacement alias, and `native_compile_local`, a local TeX build from a verified
+live-text snapshot and exported assets. `native_compile` uses Overleaf's cloud
+compiler; it is not the local snapshot helper. Local compilation needs TeX Live
+and `latexmk`, and local fonts/packages can differ from the server. Snapshot
+assets are not certified as one atomic Overleaf export.
+
+### Safe editing and review
+
+Read the current file first:
+
+```json
+{"project_id":"0123456789abcdef01234567","path":"main.tex"}
+```
+
+Pass the returned version to `native_find_and_replace`, for example:
+
+```json
+{
+  "project_id":"0123456789abcdef01234567",
+  "path":"main.tex",
+  "old_string":"the old approximation",
+  "new_string":"the revised approximation",
+  "expected_version":95,
+  "track":"on",
+  "operation_id":"dcd3d917-b8bc-4c47-83b5-5bfd02567b8c"
+}
+```
+
+`native_edit_file` accepts complete `new_content`; `replace_all` is available for
+exact replacements. Version checks remain strict. Existing pending suggestions
+must survive unchanged apart from predicted position shifts; edits that touch
+them are refused. A server-side tracking switch can override `track:"off"`;
+the result reports effective tracking instead of silently changing that switch.
+Legacy `native_suggest_edit` always requests pending tracked changes.
+
+Accept/reject requires precise change IDs or explicit filters/`all`, with exact
+versions for every selected document. Message edits/deletes check the original
+body or its SHA256. Edits are limited to your own messages; deleting another
+author's message requires an explicit project-owner request. Thread deletion
+checks every original message body.
+
+Every mutation requires a stable `operation_id` UUID. Keep that ID and its
+arguments when checking the receipt. The backend records intent before writing;
+a repeated call reads the receipt instead of resubmitting. Lost acknowledgements,
+concurrent edits and incomplete readback remain `state:"uncertain"` and an MCP
+error. Reconcile by reading the file, pending records or thread. Partial results
+are retained; there is no automatic replay or destructive rollback. Preserve
+receipt state when moving execution hosts.
+
+### Embedding and validation
+
+Rust hosts use `login`, an in-memory `NativeSession` bound to the verified
+identity, and `serve_native` with a per-call authorization callback.
+`serve_with_native` additionally exposes the separate Git tools. Explicit HTTPS
+origins support cloud and self-hosted deployments; loopback HTTP is for local
+development/test setups. Credentials are never forwarded across origins.
+
+Protocol fixtures and source checks do not certify live-account behavior or a
+macOS wheel installation. Real-account acceptance for the expanded tools and Mac
+acceptance remain pending. Keep the package/publish dry-run and normal CI gates:
+registry publication needs matching released dependencies and maintainer review.
+Do not skip those checks or treat this branch as deployed or release-ready.

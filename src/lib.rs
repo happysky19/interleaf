@@ -16,5 +16,5 @@ mod sync;
 mod tex;
 mod text;
 
-pub use native::NativeSession;
+pub use native::{NativeSession, native_operation, native_operations, native_tool_is_mutation};
 pub use server::{INSTRUCTIONS, VERSION, serve, serve_native, serve_with_native};
