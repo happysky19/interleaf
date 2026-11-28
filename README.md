@@ -236,3 +236,5 @@ macOS wheel installation. Real-account acceptance for the expanded tools and Mac
 acceptance remain pending. Keep the package/publish dry-run and normal CI gates:
 registry publication needs matching released dependencies and maintainer review.
 Do not skip those checks or treat this branch as deployed or release-ready.
+
+mcp-name: io.github.happysky19/interleaf
