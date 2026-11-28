@@ -599,8 +599,10 @@ impl Browser {
         };
         let group = Pid::from_raw(self.child.id() as i32);
         let mut failed = false;
+        // macOS answers EPERM for a group whose only members are unreaped zombies,
+        // where Linux succeeds; the sweep below reaps the browser and retries.
         if let Err(error) = killpg(group, Signal::SIGTERM) {
-            failed |= error != Errno::ESRCH;
+            failed |= !matches!(error, Errno::ESRCH | Errno::EPERM);
         }
         let grace = Instant::now() + Duration::from_millis(500);
         loop {
@@ -615,14 +617,17 @@ impl Browser {
             }
         }
         // Kill the whole private group even if the main browser exited before its children.
-        if let Err(error) = killpg(group, Signal::SIGKILL) {
-            failed |= error != Errno::ESRCH;
-        }
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            let Ok(status) = self.child.try_wait() else {
+                failed = true;
+                break;
+            };
+            match killpg(group, Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) if status.is_some() => break,
+                Ok(()) | Err(Errno::ESRCH | Errno::EPERM) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20))
+                }
                 _ => {
                     failed = true;
                     break;

@@ -37,6 +37,7 @@ struct State {
     posts: usize,
     mode: Mode,
     tracking: bool,
+    doc_type: Option<&'static str>,
 }
 struct World {
     origin: String,
@@ -62,6 +63,7 @@ impl World {
             posts: 0,
             mode,
             tracking: true,
+            doc_type: Some("sharejs-text-ot"),
         }));
         let stopped = Arc::new(AtomicBool::new(false));
         let (shared, stop) = (state.clone(), stopped.clone());
@@ -70,6 +72,7 @@ impl World {
             while !stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         let state = shared.clone();
                         clients.push(thread::spawn(move || connection(stream, state)));
                     }
@@ -158,15 +161,24 @@ fn connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
                 }
                 "joinDoc" => {
                     assert_eq!(event["args"][0], DOC);
-                    // Current legacy tuple omits the optional doc type. Packed text
-                    // and HTTP ranges intentionally use different wire encodings.
-                    json!([
-                        null,
-                        s.text.split('\n').map(packed).collect::<Vec<_>>(),
-                        s.version,
-                        [],
-                        {}
-                    ])
+                    // Unlike HTTP ranges, joinDoc packs lines and range text.
+                    let mut ranges = json!({"changes":s.changes,"comments":s.comments});
+                    for (key, field) in [("changes", "i"), ("changes", "d"), ("comments", "c")] {
+                        for range in ranges[key].as_array_mut().unwrap() {
+                            if let Some(text) = range["op"][field].as_str() {
+                                range["op"][field] = packed(text).into();
+                            }
+                        }
+                    }
+                    let lines: Vec<_> = s.text.split('\n').map(packed).collect();
+                    let mut reply = json!([null, lines, s.version, [], ranges]);
+                    if let Some(kind) = s.doc_type {
+                        reply
+                            .as_array_mut()
+                            .unwrap()
+                            .extend([json!(kind), json!({"canSkipLeaveDoc":true})]);
+                    }
+                    reply
                 }
                 "leaveDoc" => json!([null]),
                 "applyOtUpdate" => {
@@ -441,4 +453,16 @@ fn stale_overlapping_or_untracked_requests_never_mutate() {
     assert_eq!(state.writes, 0);
     assert_eq!(state.posts, 0);
     assert_eq!(state.text, TEXT);
+}
+#[test]
+fn joined_documents_follow_the_overleaf_reply() {
+    let world = World::new(Mode::Normal);
+    let read = || world.call("native_read_file", json!({"project_id":PROJECT,"path":"main.tex"}));
+    world.state.lock().unwrap().changes[0]["op"] = json!({"p":0,"d":"α😀"});
+    assert_eq!(read().unwrap()["ranges"]["changes"][0]["op"]["d"], "α😀");
+    world.state.lock().unwrap().doc_type = None;
+    assert_eq!(read().unwrap()["text"], TEXT);
+    world.state.lock().unwrap().doc_type = Some("history-ot");
+    assert!(format!("{:#}", read().unwrap_err()).contains("unsupported native document type \"history-ot\""));
+    assert_eq!(world.state.lock().unwrap().writes, 0);
 }

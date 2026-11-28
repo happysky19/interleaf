@@ -419,10 +419,10 @@ for arg in "$@"; do
   esac
 done
 [ -n "$out" ] && [ "$safe" = yes ] || exit 5
-/bin/grep -q 'live native text' main.tex || exit 6
+/usr/bin/grep -q 'live native text' main.tex || exit 6
 printf '%s\n' '%PDF-1.4' 'live native text' > "$out/main.pdf"
 printf '%s\n' 'Output written on main.pdf (1 page).' > "$out/main.log"
-/bin/grep -q FAIL main.tex && exit 2
+/usr/bin/grep -q FAIL main.tex && exit 2
 exit 0
 "#,
         )
