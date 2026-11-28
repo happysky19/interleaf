@@ -1360,6 +1360,7 @@ mod tests {
             .unwrap();
         let root = dir.path().join("uploads");
         fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let path = root.join("image.pdf");
         fs::write(&path, b"%PDF fixture").unwrap();
         let session = NativeSession::from_reader(

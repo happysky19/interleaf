@@ -1256,6 +1256,7 @@ mod tests {
                         }
                         Err(e) => panic!("{e}"),
                     };
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                         .unwrap();
@@ -1493,6 +1494,7 @@ mod tests {
             json!({"baseUrl":"https://www.overleaf.com","cookie":"overleaf_session2=bad\nheader"}),
         ] {
             let (reader, mut writer) = UnixStream::pair().unwrap();
+            writer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
             writer.write_all(payload.to_string().as_bytes()).unwrap();
             writer.shutdown(std::net::Shutdown::Write).unwrap();
             let fd = reader.into_raw_fd();
@@ -1501,7 +1503,6 @@ mod tests {
                 session.is_ok(),
                 payload["baseUrl"] == "https://www.overleaf.com" && payload["cookie"] == COOKIE
             );
-            writer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
             let mut buffer = [0u8; 1];
             assert_eq!(writer.read(&mut buffer).unwrap(), 0, "session socket remained open");
         }

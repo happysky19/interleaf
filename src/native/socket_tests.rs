@@ -72,6 +72,7 @@ impl World {
             while !stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         let state = shared.clone();
                         clients.push(thread::spawn(move || connection(stream, state)));
                     }
