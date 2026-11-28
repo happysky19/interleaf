@@ -249,11 +249,13 @@ impl Socket {
     pub fn join(&mut self, doc: &str) -> Result<Snapshot> {
         id(doc)?;
         self.joined = Some(doc.into());
-        let values = self.ack("joinDoc", json!([doc,{"encodeRanges":true}]))?;
-        ensure!(
-            values.len() >= 5 && values.get(5).is_none_or(|kind| kind == "text"),
-            "unsupported native text document reply"
-        );
+        // Reply: [error, lines, version, ops, ranges, type, options]. Servers without
+        // history-ot omit the type; the official client then assumes ShareJS text.
+        let mut values = self.ack("joinDoc", json!([doc,{"encodeRanges":true}]))?;
+        ensure!(values.len() >= 5, "incomplete native document reply");
+        if let Some(kind) = values.get(5) {
+            ensure!(kind == "sharejs-text-ot", "unsupported native document type {kind}");
+        }
         let text = values[1]
             .as_array()
             .ok_or_else(|| anyhow!("native document text missing"))?
@@ -266,11 +268,18 @@ impl Socket {
             .as_u64()
             .filter(|v| *v <= 9_007_199_254_740_991)
             .ok_or_else(|| anyhow!("invalid native document version"))?;
-        Ok(Snapshot {
-            text,
-            version,
-            ranges: values[4].clone(),
-        })
+        // encodeRanges packs tracked and commented text the same way as the lines.
+        let mut ranges = values[4].take();
+        for (key, field) in [("changes", "i"), ("changes", "d"), ("comments", "c")] {
+            for range in ranges.get_mut(key).and_then(Value::as_array_mut).into_iter().flatten() {
+                if let Some(slot) = range.get_mut("op").and_then(|op| op.get_mut(field))
+                    && let Some(text) = slot.as_str()
+                {
+                    *slot = packed(text)?.into();
+                }
+            }
+        }
+        Ok(Snapshot { text, version, ranges })
     }
     pub fn refresh(&mut self, doc: &str) -> Result<Snapshot> {
         self.leave()?;
