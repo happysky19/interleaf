@@ -25,7 +25,7 @@ or self-hosted) or in any git repository, such as GitHub or GitLab. One binary, 
 
 The Git workflow below needs git and TeX Live (`latexmk`, `latexdiff`) for `compile` and `review`.
 Overleaf Git projects need Overleaf's Git integration. For editor services without Git, see
-[native Overleaf collaboration](#native-overleaf-collaboration-development).
+[native Overleaf collaboration](#native-overleaf-collaboration).
 
 1. Install: `cargo install interleaf`.
 2. Register it with your client:
@@ -110,24 +110,23 @@ limits are in `src/rules.toml`.
 - Every commit says which agent made it, for whom, and in which mode (`Agent: claude-code for Your Name`).
   In Overleaf's own history it appears under the token owner.
 - Overleaf comments and Track Changes are not carried by Git. Suggestion mode uses LaTeX
-  markup; the development native backend is described below.
+  markup; the native backend is described below.
 - Before submission, accept or reject all suggestions. `check` reports any that are left.
   Then delete the suggestion block from the preamble.
 - interleaf keeps its build output, review PDFs and figure sources in the clone's `.git/interleaf/`.
 - Tests: `cargo test`. The end-to-end test runs against a local bare repository that stands in for
   the remote, with a second clone acting as the co-author.
 
-## Native Overleaf collaboration (development)
+## Native Overleaf collaboration
 
-The development Rust backend provides 33 canonical native tools and two
+The Rust backend provides 33 canonical native tools and two
 compatibility helpers. It uses Overleaf's editor services directly, without
 `overleaf-mcp-native`, Node, npm, a Python adapter or a worker browser. The Git
-workflow above remains separate. These source changes do not update a running
-Fridica installation or certify a release.
+workflow above remains separate.
 
 ### Login and scope
 
-With a matching Fridica development build, the owner signs in once:
+With Fridica, the owner signs in once:
 
 ```sh
 fridica overleaf-auth login --expected-email owner@example.com
@@ -149,8 +148,7 @@ fridica overleaf-auth grant --all
 
 This changes tool capabilities only. It cannot widen the saved account,
 project, channel, recipient or expiry restrictions. Normal task admission,
-approvals and workspace confinement still apply; the command does not deploy
-this branch or activate a listener.
+approvals and workspace confinement still apply.
 
 A task may discover projects, search and read while unbound, within its saved
 scope. Every project call names an explicit `project_id`. Before a project
@@ -230,11 +228,5 @@ identity, and `serve_native` with a per-call authorization callback.
 `serve_with_native` additionally exposes the separate Git tools. Explicit HTTPS
 origins support cloud and self-hosted deployments; loopback HTTP is for local
 development/test setups. Credentials are never forwarded across origins.
-
-Protocol fixtures and source checks do not certify live-account behavior or a
-macOS wheel installation. Real-account acceptance for the expanded tools and Mac
-acceptance remain pending. Keep the package/publish dry-run and normal CI gates:
-registry publication needs matching released dependencies and maintainer review.
-Do not skip those checks or treat this branch as deployed or release-ready.
 
 mcp-name: io.github.happysky19/interleaf
